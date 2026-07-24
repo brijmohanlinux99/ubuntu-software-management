@@ -1,0 +1,13 @@
+---
+- name: Install Software
+  hosts: localhost
+  connection: local
+  become: yes
+
+  tasks:
+
+    - name: Install VLC
+      apt:
+        name: vlc
+        state: present
+        update_cache: yes
