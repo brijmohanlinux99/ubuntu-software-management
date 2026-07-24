@@ -1,4 +1,0 @@
-- name: Install VLC
-  apt:
-    name: vlc
-    state: present
