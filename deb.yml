@@ -1,13 +1,2681 @@
 ---
-- name: Install Software
+# =============================================================================
+# browser-slowness.yml  (v5, 2026-11-22)
+# v2: Zoom is never closed by earlyoom; original settings saved before the first change;
+#     -e mode=revert undoes everything.
+# v3: runs on the laptop itself (hosts: localhost, connection: local) - no inventory and no
+#     extra options needed.
+# v4: when a change needs it, the laptop restarts 5 minutes after the run (warning on screen);
+#     at most one such restart per 24 hours (no restart loop). mode=revert with nothing to undo
+#     just logs it and ends without an error.
+# v5: adds from custom-iso-setup.sh (without lockdown, passwords or apps): VPN/Wi-Fi/RustDesk
+#     rights for normal users, netdev/dialout/wireshark groups, Wi-Fi power saving off (VPN drops),
+#     automatic system/app/firmware updates, no update pop-ups, restarts Sun+Thu 07:00.
+#     Fixed vs the script: updates only from known repos (no origin=*), skipped restarts never run
+#     during working hours, apps are never updated while open (daily retry).
+# Ansible playbook: fixes Chrome slowness / laptop freezes on Ubuntu Cinnamon 24.04
+# laptops. Runs on the laptop itself. Same speed settings as STEP 11 + 12 of custom-iso-setup.sh.
+#
+# WHAT IT DOES
+#   1. zram compressed swap (zstd, 60% of RAM) + memory settings
+#   2. earlyoom: closes a heavy app early instead of the laptop freezing
+#   3. zram-only swap: slow disk swap turned off at boot (when zram is active)
+#   4. Chrome speed policies (Memory Saver, no background mode) - NO extension is installed
+#   5. chrome-gpu: Chrome graphics acceleration switched off automatically after an Intel GPU hang
+#   6. Cinnamon animations off for all users (theme, icons, FONTS, wallpaper, clock unchanged)
+#   7. Netflix/DRM fix (error M7702-1003) when /home is mounted noexec: Chrome uses its built-in
+#      Widevine from /opt. Does nothing on laptops without noexec. Lockdown stays on.
+#   8. Browser monitor (every 30 s, 7 days) + `browser-report` command + daily report 23:55
+#   9. Log of every run: /var/log/browser-slowness-playbook.log
+#                        and /var/log/browser-slowness-runs/<laptop>.log
+#  10. Restart ONLY when a change needs it: scheduled 5 minutes after the run, with a warning on
+#      screen. Never more than once per 24 hours. If nothing changed, no restart.
+#  11. UNDO: -e mode=revert puts back the laptop's ORIGINAL files, services and animation settings
+#      (saved before the first change; a laptop set up with custom-iso-setup.sh gets its own
+#      settings back). Packages it installed stay installed but switched off; group memberships
+#      stay. Then a restart.
+#  12. VPN, Wi-Fi and RustDesk settings for normal users without sudo (allow rules only); VPN plugins;
+#      `sudo vpn-check`; Wi-Fi power saving off (most common cause of VPN drops)
+#  13. Every user (and new users) in netdev, dialout, wireshark; Wireshark capture without sudo
+#  14. Automatic updates: system every 6 h (Ubuntu, Chrome, VS Code, Firefox, OnlyOffice repos only),
+#      apps daily when closed (Zoom, Slack, RustDesk ...), firmware weekly on charger; no pop-ups;
+#      `update-status`
+#  15. Restarts Sun + Thu 07:00 and daily 07:00 when an update needs it (outside working hours),
+#      notices, 7-day logs in /var/log/excitel (`excitel-maintenance status`, `sudo laptop-logs`)
+#
+# WHAT IT NEVER TOUCHES
+#   admin/root passwords, user accounts, sudo group, Win11 theme/icons/fonts/wallpaper/lock screen,
+#   apps (only adds zram-tools, earlyoom, VPN plugins, update tools), lockdown/noexec/install
+#   blocking, SSH, GRUB.
+#
+# REQUIREMENTS
+#   Laptop: Ubuntu 24.04, ansible-core 2.14 or newer, run as root (or with sudo), internet (apt).
+#
+# RUN (on the laptop, as root - e.g. from software-update.sh; no inventory file needed)
+#   ansible-playbook /root/ansible/browser-slowness.yml                      # apply
+#   ansible-playbook /root/ansible/browser-slowness.yml --check --diff       # dry run, changes nothing
+#   ansible-playbook /root/ansible/browser-slowness.yml -e mode=revert       # undo everything
+#   ansible-playbook /root/ansible/browser-slowness.yml -e allow_reboot=false # never restart
+#   Undo from GitHub only (no command change): set "mode: revert" in vars below and upload.
+#   Cancel a scheduled restart on a laptop: sudo shutdown -c
+#
+# NOTE: do not also run fix-browser-slowness.sh on the same laptop (both manage the same files).
+# =============================================================================
+
+- name: Browser slowness fix
   hosts: localhost
   connection: local
-  become: yes
+  become: true
+  gather_facts: true
+
+  vars:
+    zram_percent: 60
+    mode: apply            # apply | revert
+    allow_reboot: true     # false = never restart (changes apply at the next normal restart)
+    reboot_warning_minutes: 5
+    laptop_log: /var/log/browser-slowness-playbook.log
+    controller_log_dir: /var/log/browser-slowness-runs   # not next to the playbook: git clean would delete it
+    reboot_reasons: []
 
   tasks:
+    - name: Only Ubuntu laptops, mode apply or revert
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - mode in ['apply', 'revert']
+        fail_msg: "{{ ansible_hostname }}: needs Ubuntu and mode=apply or mode=revert"
 
-    - name: Install VLC
-      apt:
-        name: vlc
-        state: present
-        update_cache: yes
+    - name: Skip a live USB session
+      ansible.builtin.meta: end_host
+      when: "'boot=casper' in (ansible_cmdline | default({}))"
+
+    - name: Folder for logs on the Ansible machine
+      ansible.builtin.file:
+        path: "{{ controller_log_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+
+    - name: Memory before the fix
+      ansible.builtin.shell: |
+        free -m | sed -n '1,3p'
+        echo "Swap:"; swapon --show 2>/dev/null || echo "  none"
+        echo "Kernel OOM kills this boot: $(journalctl -k -b --no-pager -q 2>/dev/null | grep -c 'Out of memory: Killed')"
+      register: before
+      changed_when: false
+      check_mode: false
+
+    - name: Run
+      block:
+        - name: Apply the fixes
+          when: mode == 'apply'
+          block:
+            # ---------------- 0. backup of the original settings (first run only) ----------------
+            - name: Backup tool
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/browser-slowness-backup
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # browser-slowness-backup save|restore
+                  #   save    : before the playbook's FIRST change, keeps a copy of every file it manages (or notes
+                  #             that the file did not exist) and the on/off state of each service. Later runs keep
+                  #             this first copy, so a revert always returns to the laptop's original state.
+                  #   restore : puts every file and service state back, deletes files the playbook added.
+                  #             Never stops zram live (a full zram could freeze the laptop): it changes at the reboot.
+                  #             Packages installed by the playbook stay installed but switched off.
+                  #             Group memberships (netdev, dialout, wireshark) are kept.
+                  B=/var/lib/browser-slowness-playbook
+                  PATHS=(
+                    /etc/default/earlyoom /etc/default/zramswap /etc/sysctl.d/99-lowram.conf
+                    /etc/default/speedtune /usr/local/sbin/zram-only-swap /etc/systemd/system/zram-only-swap.service
+                    /usr/local/sbin/chrome-speed-policy /etc/opt/chrome/policies/managed/performance.json
+                    /etc/default/chrome-gpu /usr/local/sbin/chrome-gpu
+                    /etc/systemd/system/chrome-gpu.service /etc/systemd/system/chrome-gpu.timer
+                    /usr/share/glib-2.0/schemas/91-browser-slowness-effects.gschema.override /usr/local/sbin/cinnamon-effects-off
+                    /usr/local/bin/widevine-noexec-fix
+                    /etc/systemd/user/widevine-noexec-fix.service /etc/systemd/user/widevine-noexec-fix.path
+                    /usr/local/sbin/browser-health-collect /usr/local/bin/browser-report
+                    /etc/systemd/system/browser-health.service /etc/systemd/system/browser-report-daily.service
+                    /etc/systemd/system/browser-report-daily.timer /usr/share/applications/browser-report.desktop
+                    /usr/local/sbin/restart-warning
+                    /usr/local/sbin/not-live-session
+                    /etc/polkit-1/rules.d/20-user-access.rules /etc/sudoers.d/zz-rustdesk-unlock /usr/local/bin/vpn-check
+                    /usr/local/sbin/netdev-sync /etc/systemd/system/netdev-sync.service /etc/systemd/system/netdev-sync.path
+                    /etc/adduser.conf /etc/NetworkManager/conf.d/zz-wifi-powersave-off.conf
+                    /etc/update-manager/release-upgrades /etc/xdg/autostart/update-notifier.desktop
+                    /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/52custom-unattended-upgrades
+                    /etc/systemd/system/apt-daily.timer.d/override.conf /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf
+                    /usr/local/lib/app-update-fp.sh /usr/local/sbin/telegram-install-update /usr/local/sbin/app-auto-update
+                    /etc/systemd/system/app-auto-update.service /etc/systemd/system/app-auto-update.timer
+                    /usr/local/sbin/firmware-auto-update /etc/systemd/system/firmware-auto-update.service
+                    /etc/systemd/system/firmware-auto-update.timer /usr/local/bin/update-status
+                    /etc/default/excitel-maintenance /usr/local/sbin/excitel-notify /usr/local/bin/ensure-nemo-desktop
+                    /etc/xdg/autostart/ensure-nemo-desktop.desktop /etc/apt/apt.conf.d/99ensure-nemo-desktop
+                    /usr/local/sbin/excitel-reboot /usr/local/sbin/excitel-after-reboot /usr/local/bin/excitel-login-notice
+                    /etc/xdg/autostart/excitel-login-notice.desktop /usr/lib/systemd/system-sleep/excitel-reboot-catchup
+                    /etc/systemd/system/excitel-reboot.service /etc/systemd/system/excitel-reboot.timer
+                    /etc/systemd/system/excitel-reboot-required.service /etc/systemd/system/excitel-reboot-required.timer
+                    /etc/systemd/system/excitel-reboot-catchup.service /etc/systemd/system/excitel-after-reboot.service
+                    /usr/local/sbin/excitel-maintenance /usr/local/sbin/excitel-update-notify
+                    /etc/systemd/system/excitel-update-notify.service /etc/systemd/system/excitel-update-notify.timer
+                    /usr/local/sbin/excitel-logs /etc/systemd/system/excitel-logs.service /etc/systemd/system/excitel-logs.timer
+                    /etc/systemd/system/excitel-logs-boot.service /etc/systemd/system/excitel-logs-boot.timer
+                    /usr/local/sbin/laptop-logs
+                  )
+                  UNITS=(zramswap.service earlyoom.service systemd-oomd.service zram-only-swap.service
+                         chrome-gpu.timer browser-health.service browser-report-daily.timer
+                         rustdesk.service netdev-sync.service netdev-sync.path
+                         unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
+                         app-auto-update.timer firmware-auto-update.timer fwupd-refresh.timer
+                         excitel-reboot.timer excitel-reboot-required.timer excitel-after-reboot.service
+                         excitel-update-notify.timer excitel-logs.timer excitel-logs-boot.timer)
+
+                  known() { grep -qxF "$1" "$B/created.list" 2>/dev/null || [ -e "$B/files$1" ] || [ -L "$B/files$1" ]; }
+                  save() {
+                    if [ -f "$B/backup.done" ]; then      # first copy is kept; only items new in this version are added
+                      n=0
+                      for p in "${PATHS[@]}"; do
+                        known "$p" && continue
+                        if [ -e "$p" ]; then mkdir -p "$B/files$(dirname "$p")"; cp -a "$p" "$B/files$p"; else echo "$p" >> "$B/created.list"; fi
+                        n=$((n+1))
+                      done
+                      for u in "${UNITS[@]}"; do
+                        grep -q "^$u " "$B/units.list" 2>/dev/null && continue
+                        st=$(systemctl is-enabled "$u" 2>/dev/null); [ -n "$st" ] || st=absent
+                        echo "$u $st" >> "$B/units.list"; n=$((n+1))
+                      done
+                      if [ "$n" -gt 0 ]; then echo "SAVED $n new items to the backup from $(cat "$B/backup.done")"
+                      else echo "backup already exists from $(cat "$B/backup.done") - kept"; fi
+                      return 0
+                    fi
+                    rm -rf "$B"; mkdir -p "$B/files"; chmod 700 "$B"; : > "$B/created.list"; : > "$B/units.list"
+                    for p in "${PATHS[@]}"; do
+                      if [ -e "$p" ]; then mkdir -p "$B/files$(dirname "$p")"; cp -a "$p" "$B/files$p"
+                      else echo "$p" >> "$B/created.list"; fi
+                    done
+                    for u in "${UNITS[@]}"; do
+                      st=$(systemctl is-enabled "$u" 2>/dev/null); [ -n "$st" ] || st=absent
+                      echo "$u $st" >> "$B/units.list"
+                    done
+                    date '+%Y-%m-%d %H:%M:%S' > "$B/backup.done"
+                    echo "SAVED backup of the original settings"
+                  }
+
+                  restore() {
+                    [ -f "$B/backup.done" ] || { echo "NO BACKUP found in $B - nothing to restore"; exit 2; }
+                    # 1. switch off services/timers whose unit files the playbook added
+                    while read -r p; do
+                      case "$p" in
+                        /etc/systemd/system/zram-only-swap.service) systemctl disable zram-only-swap.service 2>/dev/null ;;
+                        /etc/systemd/system/*) systemctl disable --now "$(basename "$p")" 2>/dev/null ;;
+                        /etc/systemd/user/*)   systemctl --global disable "$(basename "$p")" 2>/dev/null ;;
+                      esac
+                    done < "$B/created.list"
+                    # 2. files back as they were; files the playbook added are deleted
+                    while read -r p; do [ -n "$p" ] && rm -f "$p" && echo "removed  $p"; done < "$B/created.list"
+                    for p in "${PATHS[@]}"; do
+                      [ -e "$B/files$p" ] && cp -a "$B/files$p" "$p" && echo "restored $p"
+                    done
+                    systemctl daemon-reload
+                    # 3. services back to their original on/off state
+                    while read -r u st; do
+                      [ -e "/etc/systemd/system/$u" ] || [ -e "/lib/systemd/system/$u" ] || [ -e "/usr/lib/systemd/system/$u" ] || continue
+                      case "$st" in
+                        enabled|enabled-runtime|static|alias|indirect|generated)
+                          systemctl enable "$u" 2>/dev/null
+                          case "$u" in
+                            *.timer|*.path|earlyoom.service|browser-health.service|unattended-upgrades.service|rustdesk.service)
+                               systemctl restart "$u" 2>/dev/null ;;
+                            *) ;;                                                    # boot-time services: take effect at the reboot
+                          esac ;;
+                        *)
+                          case "$u" in
+                            zramswap.service|zram-only-swap.service) systemctl disable "$u" 2>/dev/null ;;   # no live swapoff
+                            *) systemctl disable --now "$u" 2>/dev/null ;;
+                          esac ;;
+                      esac
+                      echo "service  $u -> $st"
+                    done < "$B/units.list"
+                    sysctl --system >/dev/null 2>&1
+                    [ -f /usr/share/glib-2.0/schemas/org.cinnamon.gschema.xml ] && glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null
+                    rm -rf "$B"
+                    echo "RESTORED - restart the laptop to finish (zram/swap and memory settings)"
+                  }
+
+                  case "${1:-}" in
+                    save) save ;;
+                    restore) restore ;;
+                    *) echo "Usage: browser-slowness-backup save|restore"; exit 1 ;;
+                  esac
+
+            - name: Save the original settings (before any change; kept on later runs)
+              ansible.builtin.command: /usr/local/sbin/browser-slowness-backup save
+              register: r_backup
+              changed_when: "'SAVED' in r_backup.stdout"
+
+            # ---------------- 1-3. memory: earlyoom, zram, sysctl, zram-only ----------------
+            - name: earlyoom settings (written BEFORE install; Zoom is never closed)
+              ansible.builtin.copy:
+                dest: /etc/default/earlyoom
+                mode: "0644"
+                content: !unsafe |
+                  EARLYOOM_ARGS="-r 0 -m 5 -s 10 --prefer (^|/)(chrome|code|Viber|tabby|onlyoffice|DesktopEditors)$ --avoid (^|/)(cinnamon|Xorg|Xwayland|systemd|init|sshd|pipewire|wireplumber|lightdm|rustdesk|PacketTracer|AppRun|zoom|ZoomWebviewHost)$"
+              register: r_earlyoom_cfg
+
+            - name: zram settings
+              ansible.builtin.copy:
+                dest: /etc/default/zramswap
+                mode: "0644"
+                content: |
+                  ALGO=zstd
+                  PERCENT={{ zram_percent }}
+                  PRIORITY=100
+              register: r_zram_cfg
+
+            - name: Install zram-tools, earlyoom, libnotify-bin (no other updates)
+              ansible.builtin.apt:
+                name: [zram-tools, earlyoom, libnotify-bin, python3]
+                state: present
+                update_cache: true
+                cache_valid_time: 3600
+                lock_timeout: 600
+              register: r_packages
+
+            - name: earlyoom on
+              ansible.builtin.systemd:
+                name: earlyoom
+                enabled: true
+                state: "{{ 'restarted' if r_earlyoom_cfg.changed else 'started' }}"
+
+            - name: systemd-oomd off (earlyoom does this job)
+              ansible.builtin.systemd:
+                name: systemd-oomd
+                enabled: false
+                state: stopped
+              failed_when: false
+
+            - name: zramswap enabled (started fresh at the reboot, never restarted live - a full zram could freeze)
+              ansible.builtin.systemd:
+                name: zramswap
+                enabled: true
+
+            - name: Memory settings for zram
+              ansible.builtin.copy:
+                dest: /etc/sysctl.d/99-lowram.conf
+                mode: "0644"
+                content: |
+                  vm.swappiness=100
+                  vm.vfs_cache_pressure=50
+                  vm.page-cluster=0
+                  vm.dirty_background_ratio=5
+                  vm.dirty_ratio=10
+              register: r_sysctl
+
+            - name: Apply memory settings now (safe live)
+              ansible.builtin.command: sysctl --system
+              changed_when: true
+              when: r_sysctl.changed
+
+            - name: zram-only swap setting
+              ansible.builtin.copy:
+                dest: /etc/default/speedtune
+                mode: "0644"
+                content: |
+                  # yes = when zram is active, turn off disk swap at boot (prevents freezes)
+                  ZRAM_ONLY="yes"
+              register: r_speedtune
+
+            - name: zram-only swap script
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/zram-only-swap
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  source /etc/default/speedtune 2>/dev/null
+                  [ "${ZRAM_ONLY:-yes}" = "yes" ] || exit 0
+                  swapon --noheadings --show=NAME | grep -q '^/dev/zram' || exit 0
+                  for s in $(swapon --noheadings --show=NAME); do
+                    case "$s" in /dev/zram*) ;; *) swapoff "$s" ;; esac
+                  done
+                  exit 0
+              register: r_zramonly_script
+
+            - name: zram-only swap service
+              ansible.builtin.copy:
+                dest: /etc/systemd/system/zram-only-swap.service
+                mode: "0644"
+                content: |
+                  [Unit]
+                  Description=Use only compressed zram swap (no slow disk swap)
+                  After=zramswap.service swap.target
+                  Wants=zramswap.service
+
+                  [Service]
+                  Type=oneshot
+                  ExecStart=/usr/local/sbin/zram-only-swap
+                  RemainAfterExit=yes
+
+                  [Install]
+                  WantedBy=multi-user.target
+              register: r_zramonly_unit
+
+            - name: zram-only swap enabled (runs at next boot)
+              ansible.builtin.systemd:
+                name: zram-only-swap.service
+                enabled: true
+                daemon_reload: true
+
+            # ---------------- 4-5. Chrome ----------------
+            - name: Chrome policy merge tool
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/chrome-speed-policy
+                mode: "0755"
+                content: !unsafe |
+                  #!/usr/bin/env python3
+                  """chrome-speed-policy: merges the Chrome speed policies into performance.json.
+                  Keeps every other policy already in the file (for example an extension list set by the
+                  main setup script) and never adds one. Prints CHANGED when the file was rewritten."""
+                  import json, os
+                  P = "/etc/opt/chrome/policies/managed/performance.json"
+                  WANT = {
+                      "HighEfficiencyModeEnabled": True,
+                      "MemorySaverModeSavings": 2,
+                      "BackgroundModeEnabled": False,
+                      "NetworkPredictionOptions": 2,
+                      "MetricsReportingEnabled": False,
+                  }
+                  os.makedirs(os.path.dirname(P), exist_ok=True)
+                  try:
+                      d = json.load(open(P))
+                      if not isinstance(d, dict):
+                          d = {}
+                  except Exception:
+                      d = {}
+                  new = dict(d)
+                  new.update(WANT)
+                  new.setdefault("HardwareAccelerationModeEnabled", True)   # chrome-gpu switches this when needed
+                  if new != d or not os.path.exists(P):
+                      tmp = P + ".tmp"
+                      with open(tmp, "w") as f:
+                          json.dump(new, f, indent=2)
+                          f.write("\n")
+                      os.chmod(tmp, 0o644)
+                      os.replace(tmp, P)
+                      print("CHANGED")
+
+            - name: Chrome speed policies (keeps other policies, adds no extension)
+              ansible.builtin.command: /usr/local/sbin/chrome-speed-policy
+              register: r_policy
+              changed_when: "'CHANGED' in r_policy.stdout"
+
+            - name: chrome-gpu setting (an existing on/off choice is kept)
+              ansible.builtin.copy:
+                dest: /etc/default/chrome-gpu
+                mode: "0644"
+                force: false
+                content: |
+                  # Chrome graphics acceleration: auto | on | off   (change with: sudo chrome-gpu ...)
+                  CHROME_GPU="auto"
+
+            - name: chrome-gpu tool
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/chrome-gpu
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # chrome-gpu auto    -> on, switched off automatically after an Intel "GPU HANG"
+                  # chrome-gpu on|off  -> always on / always off on this laptop
+                  # chrome-gpu status  -> show setting, detection result, policy
+                  # chrome-gpu apply   -> (boot/hourly) evaluate and write the Chrome policy
+                  CONF=/etc/default/chrome-gpu
+                  STATE=/var/lib/custom-iso/chrome-gpu.state
+                  POLICY=/etc/opt/chrome/policies/managed/performance.json
+                  CHROME_GPU="auto"; [ -f "$CONF" ] && . "$CONF"
+                  HANG="no"; SINCE=0; [ -f "$STATE" ] && . "$STATE"
+                  mkdir -p /var/lib/custom-iso
+                  save_state() { printf 'HANG="%s"\nSINCE=%s\n' "$HANG" "$SINCE" > "$STATE"; }
+                  detect_hang() {   # Intel graphics driver hangs/resets since SINCE (max. 7 days back)
+                    local since=$(( $(date +%s) - 7*86400 )); [ "$SINCE" -gt "$since" ] && since=$SINCE
+                    journalctl -k --since "@$since" --no-pager -q 2>/dev/null \
+                      | grep -qE '(i915|xe ).*(GPU HANG|Timedout job|Resetting chip|GT[0-9]*: reset)'
+                  }
+                  write_policy() {  # $1 = true|false
+                    [ -f "$POLICY" ] || return 0
+                    python3 - "$POLICY" "$1" <<'PY'
+                  import json, sys
+                  p, val = sys.argv[1], sys.argv[2] == "true"
+                  try:
+                      d = json.load(open(p))
+                  except Exception:
+                      d = {}
+                  if d.get("HardwareAccelerationModeEnabled") != val:
+                      d["HardwareAccelerationModeEnabled"] = val
+                      json.dump(d, open(p, "w"), indent=2)
+                  PY
+                  }
+                  case "${1:-apply}" in
+                    on|off|auto)
+                      [ "$(id -u)" -eq 0 ] || { echo "Run with sudo."; exit 1; }
+                      printf '# Chrome graphics acceleration: auto | on | off   (change with: sudo chrome-gpu ...)\nCHROME_GPU="%s"\n' "$1" > "$CONF"
+                      CHROME_GPU="$1"
+                      if [ "$1" = "auto" ]; then HANG="no"; SINCE=$(date +%s); save_state; fi   # fresh start
+                      ;;
+                    status)
+                      p=$(python3 -c "import json;print(json.load(open('$POLICY')).get('HardwareAccelerationModeEnabled'))" 2>/dev/null)
+                      echo "Setting: $CHROME_GPU   GPU hang detected (auto): $HANG   Chrome acceleration now: ${p:-unknown}"
+                      exit 0 ;;
+                    apply) ;;
+                    *) echo "Usage: sudo chrome-gpu auto | on | off | status"; exit 1 ;;
+                  esac
+                  case "$CHROME_GPU" in
+                    on)  write_policy true ;;
+                    off) write_policy false ;;
+                    *)   if [ "$HANG" != "yes" ] && detect_hang; then HANG="yes"; save_state
+                           logger -t chrome-gpu "Intel GPU hang detected - Chrome graphics acceleration switched off"
+                         fi
+                         [ "$HANG" = "yes" ] && write_policy false || write_policy true ;;
+                  esac
+                  if [ "${1:-apply}" != "apply" ]; then
+                    case "$CHROME_GPU" in on) now=ON ;; off) now=OFF ;; *) [ "$HANG" = "yes" ] && now=OFF || now=ON ;; esac
+                    echo "Chrome graphics acceleration: $now (setting: $CHROME_GPU) - takes effect when Chrome is restarted."
+                  fi
+                  exit 0
+
+            - name: chrome-gpu service and hourly timer
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ item.name }}"
+                mode: "0644"
+                content: "{{ item.content }}"
+              loop:
+                - name: chrome-gpu.service
+                  content: |
+                    [Unit]
+                    Description=Chrome graphics acceleration (auto: off after an Intel GPU hang)
+
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/sbin/chrome-gpu apply
+                    Nice=19
+                - name: chrome-gpu.timer
+                  content: |
+                    [Unit]
+                    Description=Check for Intel GPU hangs (Chrome graphics acceleration)
+
+                    [Timer]
+                    OnBootSec=2min
+                    OnUnitActiveSec=1h
+
+                    [Install]
+                    WantedBy=timers.target
+              loop_control:
+                label: "{{ item.name }}"
+
+            - name: chrome-gpu timer on
+              ansible.builtin.systemd:
+                name: chrome-gpu.timer
+                enabled: true
+                state: started
+                daemon_reload: true
+
+            - name: chrome-gpu check now
+              ansible.builtin.command: /usr/local/sbin/chrome-gpu apply
+              changed_when: false
+
+            # ---------------- 6. Cinnamon animations off ----------------
+            - name: Is Cinnamon installed?
+              ansible.builtin.stat:
+                path: /usr/share/glib-2.0/schemas/org.cinnamon.gschema.xml
+              register: r_cinnamon
+
+            - name: Animations off for new users (default only, nothing else)
+              ansible.builtin.copy:
+                dest: /usr/share/glib-2.0/schemas/91-browser-slowness-effects.gschema.override
+                mode: "0644"
+                content: |
+                  [org.cinnamon]
+                  desktop-effects-workspace=false
+                  desktop-effects-on-dialogs=false
+                  desktop-effects-on-menus=false
+                  enable-vfade=false
+                  startup-animation=false
+
+                  [org.cinnamon.desktop.interface]
+                  enable-animations=false
+              register: r_schema
+              when: r_cinnamon.stat.exists
+
+            - name: Compile desktop defaults (undo the file if it fails)
+              ansible.builtin.shell: |
+                glib-compile-schemas /usr/share/glib-2.0/schemas && exit 0
+                rm -f /usr/share/glib-2.0/schemas/91-browser-slowness-effects.gschema.override
+                glib-compile-schemas /usr/share/glib-2.0/schemas
+                echo "schema override removed"; exit 1
+                
+              when: r_cinnamon.stat.exists and r_schema.changed
+
+            - name: Animations-off tool for existing users
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/cinnamon-effects-off
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # cinnamon-effects-off            : animations off for every existing desktop user
+                  # cinnamon-effects-off --restore  : puts back each user's own values from before the first change
+                  # Only animation keys: theme, icons, fonts, wallpaper and clock are never touched.
+                  # Prints "CHANGED <user>" / "RESTORED <user>". Original values: /var/lib/browser-slowness-playbook/effects-<user>.orig
+                  B=/var/lib/browser-slowness-playbook
+                  INNER='c=0
+                  while read -r schema key; do
+                    [ -n "$schema" ] || continue
+                    gsettings writable "$schema" "$key" >/dev/null 2>&1 || continue
+                    v=$(gsettings get "$schema" "$key" 2>/dev/null)
+                    [ "$v" = "false" ] && continue
+                    echo "ORIG $schema $key $v"
+                    gsettings set "$schema" "$key" false 2>/dev/null && c=1
+                  done <<KEYS
+                  org.cinnamon desktop-effects-workspace
+                  org.cinnamon desktop-effects-on-dialogs
+                  org.cinnamon desktop-effects-on-menus
+                  org.cinnamon enable-vfade
+                  org.cinnamon startup-animation
+                  org.cinnamon.desktop.interface enable-animations
+                  KEYS
+                  [ "$c" = 1 ] && echo CHANGED
+                  exit 0'
+                  RESTORE='while read -r schema key value; do
+                    [ -n "$schema" ] && gsettings set "$schema" "$key" "$value" 2>/dev/null
+                  done; exit 0'
+                  as_user() {   # as_user USER UID HOME SCRIPT  (stdin passed through)
+                    local bus="/run/user/$2/bus"
+                    if [ -S "$bus" ]; then   # logged in: use their own session so the change shows up there
+                      runuser -u "$1" -- env HOME="$3" XDG_RUNTIME_DIR="/run/user/$2" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" bash -c "$4" 2>/dev/null
+                    else                     # not logged in: short private session just to write the settings
+                      runuser -u "$1" -- env HOME="$3" dbus-run-session -- bash -c "$4" 2>/dev/null
+                    fi
+                  }
+                  cd /
+                  getent passwd | while IFS=: read -r u _ uid _ _ home shell; do
+                    [ "$uid" -ge 1000 ] 2>/dev/null && [ "$uid" -lt 60000 ] || continue
+                    [ -d "$home" ] || continue
+                    case "$shell" in */nologin|*/false) continue ;; esac
+                    orig="$B/effects-$u.orig"
+                    if [ "${1:-}" = "--restore" ]; then
+                      [ -f "$orig" ] || continue
+                      as_user "$u" "$uid" "$home" "$RESTORE" < "$orig" && rm -f "$orig" && echo "RESTORED $u"
+                    else
+                      out=$(as_user "$u" "$uid" "$home" "$INNER" < /dev/null)
+                      if printf '%s\n' "$out" | grep -qx CHANGED; then
+                        if [ ! -f "$orig" ]; then mkdir -p "$B"; printf '%s\n' "$out" | sed -n 's/^ORIG //p' > "$orig"; fi
+                        echo "CHANGED $u"
+                      fi
+                    fi
+                  done
+                  exit 0
+              when: r_cinnamon.stat.exists
+
+            - name: Animations off for existing users
+              ansible.builtin.command: /usr/local/sbin/cinnamon-effects-off
+              register: r_effects
+              changed_when: "'CHANGED' in r_effects.stdout"
+              when: r_cinnamon.stat.exists
+
+            # ---------------- 7. Netflix / DRM fix for noexec /home ----------------
+            - name: Widevine fix tool
+              ansible.builtin.copy:
+                dest: /usr/local/bin/widevine-noexec-fix
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # widevine-noexec-fix: Netflix / Prime / Disney+ error M7702-1003 on laptops with /home mounted noexec.
+                  # Chrome loads its newest Widevine (DRM) copy from ~/.config/google-chrome/WidevineCdm, but Linux
+                  # refuses to load program code from a noexec /home. Removing Chrome's "hint" file makes Chrome use
+                  # the copy it ships in /opt/google/chrome/WidevineCdm instead, which works. Lockdown stays on.
+                  # Usage: widevine-noexec-fix [HOME_DIR]   (runs at login and when Chrome updates the hint file)
+                  H="${1:-$HOME}"
+                  [ -n "$H" ] && [ -d "$H" ] || exit 0
+                  findmnt -no OPTIONS -T "$H" 2>/dev/null | tr ',' '\n' | grep -qx noexec || exit 0   # only on noexec /home
+                  [ -d /opt/google/chrome/WidevineCdm ] || exit 0                                      # no built-in copy: leave alone
+                  hint="$H/.config/google-chrome/WidevineCdm/latest-component-updated-widevine-cdm"
+                  [ -e "$hint" ] || exit 0
+                  rm -f "$hint" && {
+                    logger -t widevine-noexec-fix "removed $hint (/home is noexec): Chrome uses /opt/google/chrome/WidevineCdm"
+                    echo "REMOVED $hint"
+                  }
+                  exit 0
+
+            - name: Widevine fix runs at every login and when Chrome updates Widevine
+              ansible.builtin.copy:
+                dest: "/etc/systemd/user/{{ item.name }}"
+                mode: "0644"
+                content: "{{ item.content }}"
+              loop:
+                - name: widevine-noexec-fix.service
+                  content: |
+                    [Unit]
+                    Description=Netflix/DRM fix: use Chrome's built-in Widevine when /home is noexec
+
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/bin/widevine-noexec-fix
+
+                    [Install]
+                    WantedBy=default.target
+                - name: widevine-noexec-fix.path
+                  content: !unsafe |
+                    [Unit]
+                    Description=Watch Chrome's Widevine update hint (noexec /home fix)
+
+                    [Path]
+                    PathChanged=%h/.config/google-chrome/WidevineCdm/latest-component-updated-widevine-cdm
+                    Unit=widevine-noexec-fix.service
+
+                    [Install]
+                    WantedBy=default.target
+              loop_control:
+                label: "{{ item.name }}"
+              register: r_widevine_units
+
+            - name: Widevine fix enabled for all users
+              ansible.builtin.command: systemctl --global enable widevine-noexec-fix.service widevine-noexec-fix.path
+              changed_when: true
+              when: r_widevine_units.changed
+
+            - name: Widevine fix now for every user (only acts if /home is noexec)
+              ansible.builtin.shell: |
+                getent passwd | awk -F: '$3>=1000 && $3<60000 {print $6}' | while read -r h; do
+                  [ -d "$h" ] && /usr/local/bin/widevine-noexec-fix "$h"
+                done; exit 0
+              register: r_widevine_now
+              changed_when: "'REMOVED' in r_widevine_now.stdout"
+
+            - name: Is /home noexec?
+              ansible.builtin.shell: findmnt -no OPTIONS -T /home | tr ',' '\n' | grep -qx noexec && echo yes || echo no
+              register: r_noexec
+              changed_when: false
+              check_mode: false
+
+            # ---------------- 8. Browser monitor + report ----------------
+            - name: Browser monitor (collector)
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/browser-health-collect
+                mode: "0755"
+                content: !unsafe |
+                  #!/usr/bin/env python3
+                  """Browser health collector: samples system + Chrome health every 30 s.
+                  Writes /var/log/browser-health/metrics.csv (readable by all users)."""
+                  import os, time, glob, subprocess, datetime, sys
+
+                  LOG_DIR = os.environ.get("BH_DIR", "/var/log/browser-health")
+                  CSV = os.path.join(LOG_DIR, "metrics.csv")
+                  EVENTS = os.path.join(LOG_DIR, "events.log")
+                  INTERVAL = int(os.environ.get("BH_INTERVAL", "30"))
+                  MAX_LINES = 20160          # 7 days at 30 s
+                  HEADER = ("time,mem_avail_mb,mem_total_mb,swap_used_mb,cpu_busy_pct,load1,"
+                            "psi_mem,psi_cpu,psi_io,chrome_procs,chrome_mb,top_app,top_app_mb,"
+                            "temp_c,cpu_mhz_pct,status,reasons")
+
+                  def read(path, default=""):
+                      try:
+                          with open(path) as f:
+                              return f.read()
+                      except Exception:
+                          return default
+
+                  def meminfo():
+                      m = {}
+                      for line in read("/proc/meminfo").splitlines():
+                          k, _, v = line.partition(":")
+                          try:
+                              m[k] = int(v.split()[0])
+                          except Exception:
+                              pass
+                      return m
+
+                  def cpu_times():
+                      parts = read("/proc/stat").splitlines()[0].split()[1:]
+                      vals = [int(x) for x in parts]
+                      idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                      return idle, sum(vals)
+
+                  def psi(kind):
+                      for line in read(f"/proc/pressure/{kind}").splitlines():
+                          if line.startswith("some"):
+                              for tok in line.split():
+                                  if tok.startswith("avg10="):
+                                      return float(tok[6:])
+                      return 0.0
+
+                  def app_memory():
+                      """Memory (PSS, MB) per program name; Chrome processes grouped."""
+                      apps = {}
+                      chrome_procs = 0
+                      for d in glob.glob("/proc/[0-9]*"):
+                          comm = read(d + "/comm").strip()
+                          if not comm:
+                              continue
+                          pss = 0
+                          for line in read(d + "/smaps_rollup").splitlines():
+                              if line.startswith("Pss:"):
+                                  pss = int(line.split()[1])
+                                  break
+                          if pss == 0:
+                              continue
+                          name = comm
+                          if comm.startswith("chrome") or comm == "google-chrome":
+                              name = "chrome"
+                              chrome_procs += 1
+                          apps[name] = apps.get(name, 0) + pss
+                      apps_mb = {k: v / 1024 for k, v in apps.items()}
+                      return apps_mb, chrome_procs
+
+                  def cpu_temp():
+                      best = 0.0
+                      pkg = None
+                      for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+                          t = read(z + "/temp").strip()
+                          typ = read(z + "/type").strip()
+                          if not t.lstrip("-").isdigit():
+                              continue
+                          c = int(t) / 1000
+                          if "x86_pkg" in typ or "coretemp" in typ:
+                              pkg = c
+                          best = max(best, c)
+                      return pkg if pkg is not None else best
+
+                  def cpu_speed_pct():
+                      pcts = []
+                      for c in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq"):
+                          cur, mx = read(c + "/scaling_cur_freq").strip(), read(c + "/cpuinfo_max_freq").strip()
+                          if cur.isdigit() and mx.isdigit() and int(mx) > 0:
+                              pcts.append(100 * int(cur) / int(mx))
+                      return sum(pcts) / len(pcts) if pcts else 100.0
+
+                  def check_earlyoom(seen):
+                      try:
+                          out = subprocess.run(
+                              ["journalctl", "-u", "earlyoom", "--since", "-6min", "-o", "short-iso", "--no-pager", "-q"],
+                              capture_output=True, text=True, timeout=10).stdout
+                      except Exception:
+                          return
+                      new = [l for l in out.splitlines() if "sending SIG" in l and l not in seen]
+                      if new:
+                          with open(EVENTS, "a") as f:
+                              for l in new:
+                                  f.write(l + "\n")
+                                  seen.add(l)
+                          os.chmod(EVENTS, 0o644)
+
+                  def trim_csv():
+                      try:
+                          with open(CSV) as f:
+                              lines = f.readlines()
+                          if len(lines) > MAX_LINES + 1:
+                              with open(CSV, "w") as f:
+                                  f.write(lines[0])
+                                  f.writelines(lines[-MAX_LINES:])
+                      except Exception:
+                          pass
+
+                  def main():
+                      os.makedirs(LOG_DIR, exist_ok=True)
+                      os.chmod(LOG_DIR, 0o755)
+                      if not os.path.exists(CSV) or os.path.getsize(CSV) == 0:
+                          with open(CSV, "w") as f:
+                              f.write(HEADER + "\n")
+                      os.chmod(CSV, 0o644)
+                      prev = cpu_times()
+                      seen = set()
+                      cycle = 0
+                      once = "--once" in sys.argv
+                      while True:
+                          if not once:
+                              time.sleep(INTERVAL)
+                          else:
+                              time.sleep(1)
+                          cycle += 1
+                          cur = cpu_times()
+                          dt = cur[1] - prev[1]
+                          busy = 100 * (1 - (cur[0] - prev[0]) / dt) if dt > 0 else 0.0
+                          prev = cur
+
+                          m = meminfo()
+                          total = m.get("MemTotal", 0) / 1024
+                          avail = m.get("MemAvailable", 0) / 1024
+                          swap_used = (m.get("SwapTotal", 0) - m.get("SwapFree", 0)) / 1024
+                          load1 = float(read("/proc/loadavg", "0").split()[0])
+                          pm, pc, pi = psi("memory"), psi("cpu"), psi("io")
+                          apps, chrome_procs = app_memory()
+                          chrome_mb = apps.get("chrome", 0.0)
+                          top = max(apps.items(), key=lambda kv: kv[1]) if apps else ("none", 0.0)
+                          temp = cpu_temp()
+                          speed = cpu_speed_pct()
+
+                          reasons = []
+                          if avail < 300: reasons.append("LOW_RAM")
+                          if pm > 10: reasons.append("MEM_PRESSURE")
+                          if pi > 25: reasons.append("DISK_WAIT")
+                          if busy > 90 and pc > 40: reasons.append("CPU_BUSY")
+                          if temp >= 90: reasons.append("HOT")
+                          if busy > 70 and speed < 50: reasons.append("THROTTLED")
+                          if total and chrome_mb > 0.5 * total: reasons.append("CHROME_HEAVY")
+                          status = "SLOW" if reasons else "OK"
+
+                          row = [datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 f"{avail:.0f}", f"{total:.0f}", f"{swap_used:.0f}", f"{busy:.0f}", f"{load1:.2f}",
+                                 f"{pm:.1f}", f"{pc:.1f}", f"{pi:.1f}", str(chrome_procs), f"{chrome_mb:.0f}",
+                                 top[0].replace(",", " "), f"{top[1]:.0f}", f"{temp:.0f}", f"{speed:.0f}",
+                                 status, "|".join(reasons)]
+                          with open(CSV, "a") as f:
+                              f.write(",".join(row) + "\n")
+
+                          if cycle % 10 == 0 or once:
+                              check_earlyoom(seen)
+                          if cycle % 100 == 0:
+                              trim_csv()
+                          if once:
+                              break
+
+                  if __name__ == "__main__":
+                      main()
+              register: r_collect
+
+            - name: browser-report command
+              ansible.builtin.copy:
+                dest: /usr/local/bin/browser-report
+                mode: "0755"
+                content: !unsafe |
+                  #!/usr/bin/env python3
+                  """Browser slowness report.
+                  Usage:  browser-report            last 24 hours
+                          browser-report 6          last 6 hours
+                          browser-report now        current status
+                          browser-report 24 --save  (admin/root) save report to /var/log/browser-health/"""
+                  import os, sys, csv, glob, datetime, subprocess
+
+                  LOG_DIR = os.environ.get("BH_DIR", "/var/log/browser-health")
+                  CSV = os.path.join(LOG_DIR, "metrics.csv")
+                  EVENTS = os.path.join(LOG_DIR, "events.log")
+
+                  ADVICE = {
+                      "LOW_RAM": "Free RAM ran out. Close unused tabs and heavy apps (Zoom, VS Code, OnlyOffice, Viber). "
+                                 "Use WhatsApp/Slack/Meet as Chrome web apps, not separate apps. Adding 4 GB RAM fixes this permanently.",
+                      "MEM_PRESSURE": "The system spent time waiting for memory (swapping). Keep fewer apps open at once; "
+                                      "in Chrome press Shift+Esc to find and close the heaviest tabs.",
+                      "DISK_WAIT": "Programs waited for the disk. On a hard disk (HDD) this is the main cause of freezes - "
+                                   "moving to an SSD is the biggest speed upgrade.",
+                      "CPU_BUSY": "The CPU was fully busy. Heavy pages, video, or Zoom calls cause this. Check chrome://gpu shows "
+                                  "'Hardware accelerated' for video decode, and close background video tabs.",
+                      "HOT": "CPU reached 90 C or more. Clean the fan and vents, keep the laptop on a hard surface, "
+                             "consider new thermal paste.",
+                      "THROTTLED": "CPU slowed itself down while busy (heat or power saving). Plug in the charger, set power "
+                                   "mode to Performance, clean the fan.",
+                      "CHROME_HEAVY": "Chrome alone used more than half of RAM. Memory Saver is already on Maximum; "
+                                      "keep under about 10 tabs and remove unneeded extensions.",
+                  }
+                  LABEL = {
+                      "LOW_RAM": "Low free RAM", "MEM_PRESSURE": "Memory pressure (swapping)",
+                      "DISK_WAIT": "Waiting for disk", "CPU_BUSY": "CPU fully busy", "HOT": "CPU overheating",
+                      "THROTTLED": "CPU throttled", "CHROME_HEAVY": "Chrome using >50% RAM",
+                  }
+
+                  def load_rows(hours):
+                      rows = []
+                      if not os.path.exists(CSV):
+                          return rows
+                      since = datetime.datetime.now() - datetime.timedelta(hours=hours)
+                      with open(CSV) as f:
+                          for r in csv.DictReader(f):
+                              try:
+                                  t = datetime.datetime.strptime(r["time"], "%Y-%m-%d %H:%M:%S")
+                              except Exception:
+                                  continue
+                              if t >= since:
+                                  r["_t"] = t
+                                  rows.append(r)
+                      return rows
+
+                  def num(r, k):
+                      try:
+                          return float(r[k])
+                      except Exception:
+                          return 0.0
+
+                  def system_facts():
+                      facts = []
+                      root_dev = subprocess.run(["findmnt", "-no", "SOURCE", "/"], capture_output=True, text=True).stdout.strip()
+                      disk = "unknown"
+                      try:
+                          pk = subprocess.run(["lsblk", "-no", "PKNAME", root_dev], capture_output=True, text=True).stdout.split()
+                          name = pk[0] if pk else os.path.basename(root_dev)
+                          rot = open(f"/sys/block/{name}/queue/rotational").read().strip()
+                          disk = "HDD (hard disk - slow)" if rot == "1" else "SSD"
+                      except Exception:
+                          pass
+                      facts.append(("System disk", disk))
+                      swaps = subprocess.run(["swapon", "--noheadings", "--show=NAME,SIZE"], capture_output=True, text=True).stdout.split("\n")
+                      swaps = [s.split() for s in swaps if s.strip()]
+                      facts.append(("Swap", ", ".join(f"{a} {b}" for a, b in swaps) or "none"))
+                      facts.append(("Chrome speed policy", "active" if os.path.exists("/etc/opt/chrome/policies/managed/performance.json") else "missing"))
+                      eo = subprocess.run(["systemctl", "is-active", "earlyoom"], capture_output=True, text=True).stdout.strip()
+                      facts.append(("Freeze protection (earlyoom)", eo or "unknown"))
+                      return facts
+
+                  def episodes(rows):
+                      eps, cur = [], None
+                      for r in rows:
+                          if r["status"] == "SLOW":
+                              if cur is None:
+                                  cur = {"start": r["_t"], "end": r["_t"], "reasons": {}, "min_ram": num(r, "mem_avail_mb"), "top": set()}
+                              cur["end"] = r["_t"]
+                              for x in filter(None, r["reasons"].split("|")):
+                                  cur["reasons"][x] = cur["reasons"].get(x, 0) + 1
+                              cur["min_ram"] = min(cur["min_ram"], num(r, "mem_avail_mb"))
+                              cur["top"].add(r["top_app"])
+                          elif cur:
+                              eps.append(cur); cur = None
+                      if cur:
+                          eps.append(cur)
+                      return eps
+
+                  def now_status():
+                      if not os.path.exists(CSV):
+                          print("No data yet. The browser-health service collects a sample every 30 seconds.")
+                          return
+                      with open(CSV) as f:
+                          rows = list(csv.DictReader(f))
+                      if not rows:
+                          print("No data yet."); return
+                      r = rows[-1]
+                      print(f"Status at {r['time']}: {r['status']}")
+                      print(f"  Free RAM:        {r['mem_avail_mb']} MB of {r['mem_total_mb']} MB")
+                      print(f"  Swap in use:     {r['swap_used_mb']} MB")
+                      print(f"  CPU busy:        {r['cpu_busy_pct']} %   speed {r['cpu_mhz_pct']} % of max   temp {r['temp_c']} C")
+                      print(f"  Chrome:          {r['chrome_mb']} MB in {r['chrome_procs']} processes")
+                      print(f"  Heaviest app:    {r['top_app']} ({r['top_app_mb']} MB)")
+                      for x in filter(None, r["reasons"].split("|")):
+                          print(f"  ! {LABEL.get(x, x)}")
+
+                  def build_report(hours):
+                      rows = load_rows(hours)
+                      out = []
+                      p = out.append
+                      now = datetime.datetime.now()
+                      p("=" * 70)
+                      p(f" BROWSER SLOWNESS REPORT  -  {os.uname().nodename}")
+                      p(f" Period: last {hours} hours   Generated: {now:%Y-%m-%d %H:%M}")
+                      p("=" * 70)
+                      if not rows:
+                          p("\nNo data for this period yet. The service records every 30 seconds.")
+                          return "\n".join(out)
+
+                      slow = [r for r in rows if r["status"] == "SLOW"]
+                      pct = 100 * len(slow) / len(rows)
+                      verdict = ("GOOD - no real slowness" if pct < 2 else
+                                 "FAIR - occasional slowness" if pct < 10 else
+                                 "POOR - frequent slowness")
+                      p(f"\nOVERALL: {verdict}")
+                      p(f"  Samples: {len(rows)}   Slow samples: {len(slow)} ({pct:.1f} %)")
+
+                      p("\nSYSTEM")
+                      for k, v in system_facts():
+                          p(f"  {k:30} {v}")
+
+                      avail = [num(r, "mem_avail_mb") for r in rows]
+                      chrome = [num(r, "chrome_mb") for r in rows]
+                      p("\nMEMORY AND CPU")
+                      p(f"  RAM total:                     {rows[-1]['mem_total_mb']} MB")
+                      p(f"  Free RAM average / lowest:     {sum(avail)/len(avail):.0f} MB / {min(avail):.0f} MB")
+                      p(f"  Swap used peak:                {max(num(r,'swap_used_mb') for r in rows):.0f} MB")
+                      p(f"  Chrome memory average / peak:  {sum(chrome)/len(chrome):.0f} MB / {max(chrome):.0f} MB")
+                      p(f"  Chrome processes peak:         {max(int(num(r,'chrome_procs')) for r in rows)}")
+                      p(f"  CPU temperature peak:          {max(num(r,'temp_c') for r in rows):.0f} C")
+
+                      counts = {}
+                      for r in slow:
+                          for x in filter(None, r["reasons"].split("|")):
+                              counts[x] = counts.get(x, 0) + 1
+                      p("\nCAUSES OF SLOWNESS")
+                      if counts:
+                          for k, v in sorted(counts.items(), key=lambda kv: -kv[1]):
+                              p(f"  {LABEL.get(k,k):32} {v:5} samples ({100*v/len(rows):.1f} % of time)")
+                      else:
+                          p("  None detected.")
+
+                      peak = {}
+                      for r in rows:
+                          a, mb = r["top_app"], num(r, "top_app_mb")
+                          peak[a] = max(peak.get(a, 0), mb)
+                      p("\nHEAVIEST APPS (peak memory when they were the top user)")
+                      for a, mb in sorted(peak.items(), key=lambda kv: -kv[1])[:6]:
+                          p(f"  {a:20} {mb:6.0f} MB")
+
+                      eps = episodes(rows)
+                      p(f"\nSLOW PERIODS ({len(eps)})")
+                      if eps:
+                          for e in sorted(eps, key=lambda e: e["end"] - e["start"], reverse=True)[:10]:
+                              dur = int((e["end"] - e["start"]).total_seconds() // 60) + 1
+                              main = max(e["reasons"], key=e["reasons"].get) if e["reasons"] else "?"
+                              p(f"  {e['start']:%m-%d %H:%M}  ~{dur:3} min  {LABEL.get(main, main):28} "
+                                f"lowest RAM {e['min_ram']:.0f} MB  apps: {', '.join(sorted(e['top']))[:40]}")
+                      else:
+                          p("  None.")
+
+                      p("\nFREEZE PROTECTION (apps closed by earlyoom to prevent a hang)")
+                      since = now - datetime.timedelta(hours=hours)
+                      kills = []
+                      if os.path.exists(EVENTS):
+                          for l in open(EVENTS):
+                              try:
+                                  t = datetime.datetime.fromisoformat(l.split()[0][:19])
+                                  if t >= since:
+                                      kills.append(l.strip())
+                              except Exception:
+                                  pass
+                      p("  " + ("\n  ".join(kills[-10:]) if kills else "None - no app had to be closed."))
+
+                      p("\nRECOMMENDATIONS")
+                      if not counts:
+                          p("  - No action needed. Browser and system are running smoothly.")
+                      for k, _ in sorted(counts.items(), key=lambda kv: -kv[1]):
+                          p(f"  - {ADVICE.get(k, k)}")
+                      p("\nTip: in Chrome press Shift+Esc to see which tab uses the most memory.")
+                      return "\n".join(out)
+
+                  def main():
+                      args = [a for a in sys.argv[1:] if a != "--save"]
+                      if args and args[0] in ("now", "status"):
+                          now_status(); return
+                      hours = 24
+                      if args:
+                          try:
+                              hours = max(1, int(args[0]))
+                          except ValueError:
+                              print(__doc__); return
+                      text = build_report(hours)
+                      print(text)
+                      if "--save" in sys.argv:
+                          if os.geteuid() != 0:
+                              print("\n(--save needs admin: sudo browser-report --save)"); return
+                          day = datetime.datetime.now().strftime("%Y-%m-%d")
+                          for path in (os.path.join(LOG_DIR, f"report-{day}.txt"), os.path.join(LOG_DIR, "report-latest.txt")):
+                              with open(path, "w") as f:
+                                  f.write(text + "\n")
+                              os.chmod(path, 0o644)
+                          old = sorted(glob.glob(os.path.join(LOG_DIR, "report-20*.txt")))[:-14]
+                          for o in old:
+                              os.remove(o)
+
+                  if __name__ == "__main__":
+                      main()
+
+            - name: Monitor service and daily report timer
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ item.name }}"
+                mode: "0644"
+                content: "{{ item.content }}"
+              loop:
+                - name: browser-health.service
+                  content: |
+                    [Unit]
+                    Description=Browser slowness monitor (samples RAM, CPU, disk, Chrome every 30 s)
+                    After=multi-user.target
+
+                    [Service]
+                    Type=simple
+                    ExecStart=/usr/local/sbin/browser-health-collect
+                    Restart=always
+                    RestartSec=30
+                    Nice=19
+                    IOSchedulingClass=idle
+                    MemoryMax=60M
+
+                    [Install]
+                    WantedBy=multi-user.target
+                - name: browser-report-daily.service
+                  content: |
+                    [Unit]
+                    Description=Save daily browser slowness report
+
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/bin/browser-report 24 --save
+                    Nice=19
+                - name: browser-report-daily.timer
+                  content: |
+                    [Unit]
+                    Description=Daily browser slowness report
+
+                    [Timer]
+                    OnCalendar=*-*-* 23:55:00
+                    Persistent=true
+
+                    [Install]
+                    WantedBy=timers.target
+              loop_control:
+                label: "{{ item.name }}"
+              register: r_monitor_units
+
+            - name: Browser Health Report in the app menu
+              ansible.builtin.copy:
+                dest: /usr/share/applications/browser-report.desktop
+                mode: "0644"
+                content: |
+                  [Desktop Entry]
+                  Name=Browser Health Report
+                  Comment=Why is the browser slow? Report of the last 24 hours
+                  Exec=x-terminal-emulator -e bash -c "browser-report | less -R"
+                  Icon=utilities-system-monitor
+                  Terminal=false
+                  Type=Application
+                  Categories=System;Monitor;
+
+            - name: Monitor on
+              ansible.builtin.systemd:
+                name: browser-health.service
+                enabled: true
+                state: "{{ 'restarted' if (r_collect.changed or r_monitor_units.changed) else 'started' }}"
+                daemon_reload: true
+
+            - name: Daily report timer on
+              ansible.builtin.systemd:
+                name: browser-report-daily.timer
+                enabled: true
+                state: started
+
+            # ================ 11-13. VPN, Wi-Fi, RustDesk, groups (from custom-iso-setup.sh, no lockdown) ================
+            - name: Live-session check tool (used by the restart and update tools)
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/not-live-session
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/sh
+                  # exit 0 = installed system, exit 1 = live USB session (installer)
+                  grep -qwE 'boot=casper|layerfs-path=[^ ]*' /proc/cmdline 2>/dev/null && exit 1
+                  [ -d /cdrom/casper ] && exit 1
+                  [ "$(findmnt -n -o FSTYPE / 2>/dev/null)" = "overlay" ] && exit 1
+                  exit 0
+                  NOTLIVE_EOF
+
+            - name: VPN plugins and tools (only missing ones are installed)
+              ansible.builtin.apt:
+                name: [network-manager-openvpn-gnome, network-manager-l2tp-gnome, network-manager-sstp-gnome,
+                       network-manager-openconnect-gnome, network-manager-vpnc-gnome, network-manager-pptp-gnome,
+                       network-manager-fortisslvpn-gnome, wireguard-tools, openvpn, openconnect, strongswan,
+                       xl2tpd, sstp-client, openfortivpn, vpnc, iw]
+                state: present
+                lock_timeout: 600
+              register: r_vpn_pkgs
+
+            - name: Users may manage VPN, Wi-Fi and RustDesk without sudo (allow rules only, nothing blocked)
+              ansible.builtin.copy:
+                dest: /etc/polkit-1/rules.d/20-user-access.rules
+                mode: "0644"
+                content: !unsafe |
+                  // Installed by browser-slowness.yml: the "allow" rules of custom-iso-setup.sh, without install blocking
+                  polkit.addRule(function(action, subject) {
+                      // RustDesk "Unlock settings" (older versions use pkexec for a harmless check)
+                      if (action.id == "org.freedesktop.policykit.exec" && subject.local && subject.active) {
+                          var prog = action.lookup("program") || "";
+                          if (prog == "/usr/share/rustdesk/files/polkit" || prog == "/usr/bin/echo" || prog == "/bin/echo") {
+                              return polkit.Result.AUTH_SELF;
+                          }
+                      }
+                      if (action.id.indexOf("com.rustdesk.") == 0 && subject.local && subject.active) {
+                          return polkit.Result.AUTH_SELF;
+                      }
+                      // Everyone at the computer, and netdev members from any session: network, Wi-Fi and VPN profiles
+                      if (action.id.indexOf("org.freedesktop.NetworkManager.") == 0 &&
+                          ((subject.local && subject.active) || subject.isInGroup("netdev"))) {
+                          return polkit.Result.YES;
+                      }
+                      // Everyone at the computer: start/stop/restart RustDesk and VPN services
+                      if (action.id == "org.freedesktop.systemd1.manage-units" && subject.local && subject.active) {
+                          var unit = action.lookup("unit") || "";
+                          var allowed = /^(rustdesk|openvpn.*|wg-quick@.*|strongswan.*|ipsec|xl2tpd|openfortivpn.*|forticlient.*|vpnagentd|NetworkManager)\.service$/;
+                          if (allowed.test(unit)) {
+                              return polkit.Result.YES;
+                          }
+                      }
+                  });
+              register: r_polkit
+
+            - name: RustDesk "Unlock settings" with the user's own password (runs only "echo" as root)
+              ansible.builtin.copy:
+                dest: /etc/sudoers.d/zz-rustdesk-unlock
+                mode: "0440"
+                validate: visudo -cf %s
+                content: |
+                  # RustDesk unlock check: runs only "echo" as root
+                  ALL ALL=(root) /usr/bin/sh -c echo, /bin/sh -c echo
+
+            - name: Is RustDesk installed?
+              ansible.builtin.stat:
+                path: /lib/systemd/system/rustdesk.service
+              register: r_rustdesk
+
+            - name: RustDesk service at every boot (users can use and configure it)
+              ansible.builtin.systemd:
+                name: rustdesk
+                enabled: true
+                state: started
+              when: r_rustdesk.stat.exists
+
+            - name: VPN diagnostic tool (sudo vpn-check)
+              ansible.builtin.copy:
+                dest: /usr/local/bin/vpn-check
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # Shows why a VPN does not start. Run as admin: sudo vpn-check
+                  echo "== VPN plugins installed =="
+                  ls /usr/lib/NetworkManager/VPN/*.name 2>/dev/null | xargs -r -n1 basename
+                  echo; echo "== NetworkManager =="; systemctl is-active NetworkManager
+                  echo; echo "== Lockdown polkit rule =="
+                  [ -f /etc/polkit-1/rules.d/10-lockdown.rules ] && echo "installed" || echo "MISSING (reboot needed)"
+                  grep -qs "NetworkManager" /etc/polkit-1/rules.d/10-lockdown.rules /etc/polkit-1/rules.d/20-user-access.rules && echo "VPN permission for users: yes"
+                  echo; echo "== VPN connections =="; nmcli -f NAME,TYPE,ACTIVE connection show | grep -Ei 'vpn|wireguard|NAME'
+                  echo; echo "== Last VPN errors (NetworkManager log, last 2 hours) =="
+                  journalctl -u NetworkManager --since "-2h" --no-pager -q 2>/dev/null \
+                    | grep -Ei 'vpn|openvpn|l2tp|ipsec|strongswan|sstp|forti|openconnect|wireguard|pptp|vpnc|polkit|not authorized' | tail -n 40
+                  echo; echo "== Polkit messages =="
+                  journalctl -u polkit --since "-2h" --no-pager -q 2>/dev/null | tail -n 15
+
+            - name: VPN drops - Wi-Fi power saving off (NetworkManager setting)
+              ansible.builtin.copy:
+                dest: /etc/NetworkManager/conf.d/zz-wifi-powersave-off.conf
+                mode: "0644"
+                content: |
+                  # Wi-Fi power saving makes the card sleep briefly; a VPN tunnel can time out and drop.
+                  # 2 = off. Installed by browser-slowness.yml (overrides default-wifi-powersave-on.conf)
+                  [connection]
+                  wifi.powersave = 2
+              register: r_wifi_ps
+
+            - name: VPN drops - Wi-Fi power saving off now (no disconnect)
+              ansible.builtin.shell: |
+                nmcli general reload conf 2>/dev/null || true
+                for d in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+                  if iw dev "$d" get power_save 2>/dev/null | grep -q ': on'; then
+                    iw dev "$d" set power_save off && echo "OFF $d"
+                  fi
+                done; exit 0
+              register: r_wifi_now
+              changed_when: "'OFF' in r_wifi_now.stdout"
+
+            - name: Wireshark capture without sudo (only if Wireshark is installed)
+              ansible.builtin.shell: |
+                dpkg-query -W -f='${Status}' wireshark-common 2>/dev/null | grep -q 'install ok installed' || { echo "not installed"; exit 0; }
+                cur=$(debconf-show wireshark-common 2>/dev/null | awk -F': ' '/install-setuid/{print $2}')
+                [ "$cur" = "true" ] && getent group wireshark >/dev/null && { echo "already on"; exit 0; }
+                echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
+                DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive wireshark-common && echo "CHANGED"
+              register: r_wireshark
+              changed_when: "'CHANGED' in r_wireshark.stdout"
+
+            - name: Group sync tool (netdev, dialout, wireshark for every user)
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/netdev-sync
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # Group membership for every normal user account (existing and new):
+                  #   netdev    - manage network and VPN
+                  #   dialout   - console cables / serial devices (switches, routers, scanners)
+                  #   wireshark - packet capture; who gets it is set by WIRESHARK_USERS in
+                  #               /etc/default/lockdown: "all" | "none" | "user1 user2"
+                  WIRESHARK_USERS="all"; ALLOWED_ADMINS=""
+                  [ -f /etc/default/lockdown ] && . /etc/default/lockdown
+                  for g in netdev dialout; do getent group "$g" >/dev/null || groupadd -r "$g"; done
+                  min=$(awk '/^UID_MIN/{print $2}' /etc/login.defs); min=${min:-1000}
+                  max=$(awk '/^UID_MAX/{print $2}' /etc/login.defs); max=${max:-60000}
+                  in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$2"; }
+                  getent passwd | while IFS=: read -r user _ uid _ _ _ shell; do
+                    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+                    [ "$uid" -ge "$min" ] && [ "$uid" -le "$max" ] || continue
+                    case "$shell" in */nologin|*/false) continue ;; esac
+                    for g in netdev dialout; do
+                      in_group "$user" "$g" || { usermod -aG "$g" "$user" && echo "added $user to $g"; }
+                    done
+                    if getent group wireshark >/dev/null; then
+                      if [[ " $ALLOWED_ADMINS " == *" $user "* ]]; then want=yes
+                      else
+                        case "$WIRESHARK_USERS" in
+                          all) want=yes ;; none|"") want=no ;;
+                          *) [[ " $WIRESHARK_USERS " == *" $user "* ]] && want=yes || want=no ;;
+                        esac
+                      fi
+                      if [ "$want" = "yes" ]; then
+                        in_group "$user" wireshark || { usermod -aG wireshark "$user" && echo "added $user to wireshark"; }
+                      else
+                        in_group "$user" wireshark && gpasswd -d "$user" wireshark >/dev/null && echo "removed $user from wireshark"
+                      fi
+                    fi
+                  done
+                  exit 0
+
+            - name: Group sync at every boot and whenever a user is added
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ item.name }}"
+                mode: "0644"
+                content: "{{ item.content }}"
+              loop:
+                - name: netdev-sync.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Add all users to the netdev group
+
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/sbin/netdev-sync
+
+                    [Install]
+                    WantedBy=multi-user.target
+                - name: netdev-sync.path
+                  content: !unsafe |
+                    [Unit]
+                    Description=Watch for new users (add them to netdev)
+
+                    [Path]
+                    PathChanged=/etc/passwd
+
+                    [Install]
+                    WantedBy=multi-user.target
+              loop_control:
+                label: "{{ item.name }}"
+
+            - name: Group sync enabled
+              ansible.builtin.systemd:
+                name: "{{ item }}"
+                enabled: true
+                daemon_reload: true
+              loop: [netdev-sync.service, netdev-sync.path]
+
+            - name: Watch for new users now
+              ansible.builtin.systemd:
+                name: netdev-sync.path
+                state: started
+
+            - name: New users created with adduser also get netdev
+              ansible.builtin.shell: |
+                [ -f /etc/adduser.conf ] || exit 0
+                before=$(md5sum /etc/adduser.conf)
+                sed -i 's/^#\?ADD_EXTRA_GROUPS=.*/ADD_EXTRA_GROUPS=1/' /etc/adduser.conf
+                grep -q '^ADD_EXTRA_GROUPS=' /etc/adduser.conf || echo 'ADD_EXTRA_GROUPS=1' >> /etc/adduser.conf
+                if grep -q '^EXTRA_GROUPS=' /etc/adduser.conf; then
+                  grep -q '^EXTRA_GROUPS=.*netdev' /etc/adduser.conf || \
+                    sed -i 's/^EXTRA_GROUPS="\(.*\)"/EXTRA_GROUPS="\1 netdev"/' /etc/adduser.conf
+                else
+                  echo 'EXTRA_GROUPS="users netdev"' >> /etc/adduser.conf
+                fi
+                [ "$before" = "$(md5sum /etc/adduser.conf)" ] || echo CHANGED
+              register: r_adduser
+              changed_when: "'CHANGED' in r_adduser.stdout"
+
+            - name: Add every user to netdev, dialout, wireshark now
+              ansible.builtin.command: /usr/local/sbin/netdev-sync
+              register: r_groups
+              changed_when: "'added' in r_groups.stdout"
+
+            # ================ 14. no update pop-ups ================
+            - name: No Ubuntu version-upgrade offers or update pop-ups (updates are automatic)
+              ansible.builtin.shell: |
+                c=0
+                if [ -f /etc/update-manager/release-upgrades ]; then
+                  grep -q '^Prompt=never' /etc/update-manager/release-upgrades || { sed -i 's/^Prompt=.*/Prompt=never/' /etc/update-manager/release-upgrades; c=1; }
+                else
+                  mkdir -p /etc/update-manager; printf '[DEFAULT]\nPrompt=never\n' > /etc/update-manager/release-upgrades; c=1
+                fi
+                for f in /etc/xdg/autostart/update-notifier.desktop; do
+                  [ -f "$f" ] || continue
+                  grep -q '^Hidden=true' "$f" || { sed -i '/^\[Desktop Entry\]/a Hidden=true' "$f"; c=1; }
+                done
+                [ "$c" = 1 ] && echo CHANGED; exit 0
+              register: r_popups
+              changed_when: "'CHANGED' in r_popups.stdout"
+
+            # ================ 15. automatic updates: system, apps, firmware ================
+            - name: Update tools (unattended-upgrades, fwupd, zenity, curl, wget)
+              ansible.builtin.apt:
+                name: [unattended-upgrades, fwupd, zenity, curl, wget]
+                state: present
+                lock_timeout: 600
+
+            - name: System updates every 6 hours (settings)
+              ansible.builtin.copy:
+                dest: "{{ item.dest }}"
+                mode: "0644"
+                content: "{{ item.content }}"
+              loop:
+                - dest: /etc/apt/apt.conf.d/20auto-upgrades
+                  content: !unsafe |
+                    APT::Periodic::Update-Package-Lists "1";
+                    APT::Periodic::Download-Upgradeable-Packages "1";
+                    APT::Periodic::Unattended-Upgrade "1";
+                    APT::Periodic::AutocleanInterval "7";
+                - dest: /etc/apt/apt.conf.d/52custom-unattended-upgrades
+                  content: !unsafe |
+                    // Update packages ONLY from these repositories (not from any repo added later):
+                    // Ubuntu (security + normal updates), Chrome, VS Code, Firefox (Mozilla), OnlyOffice
+                    Unattended-Upgrade::Origins-Pattern {
+                            "origin=Ubuntu,archive=${distro_codename}-security";
+                            "origin=Ubuntu,archive=${distro_codename}-updates";
+                            "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";
+                            "origin=UbuntuESM,archive=${distro_codename}-infra-security";
+                            "site=dl.google.com";
+                            "site=packages.microsoft.com";
+                            "site=packages.mozilla.org";
+                            "site=download.onlyoffice.com";
+                    };
+                    // Keep our custom config files (GRUB, sudo, SSH) when packages update
+                    Dpkg::Options {
+                            "--force-confdef";
+                            "--force-confold";
+                    };
+                    Unattended-Upgrade::MinimalSteps "true";
+                    Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+                    Unattended-Upgrade::Remove-Unused-Dependencies "false";
+                    // Never reboot while someone is working
+                    Unattended-Upgrade::Automatic-Reboot "false";
+              loop_control:
+                label: "{{ item.dest }}"
+              register: r_aptcfg
+
+            - name: Update check times (00, 06, 12, 18 h)
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ item }}.timer.d/override.conf"
+                mode: "0644"
+                content: !unsafe |
+                  [Timer]
+                  OnCalendar=
+                  OnCalendar=*-*-* 00,06,12,18:00
+                  RandomizedDelaySec=30m
+                  Persistent=true
+              loop: [apt-daily, apt-daily-upgrade]
+              register: r_apt_timers
+
+            - name: Download helpers for app updates
+              ansible.builtin.copy:
+                dest: "{{ item.dest }}"
+                mode: "{{ item.mode }}"
+                content: "{{ item.content }}"
+              loop:
+                - dest: /usr/local/lib/app-update-fp.sh
+                  mode: "0644"
+                  content: !unsafe |
+                    # Shared download helpers (setup script, weekly app updater, Telegram updater).
+                    # Some ISPs block GitHub's file servers (*.githubusercontent.com) via DNS; then a
+                    # download is retried with DNS-over-HTTPS (Cloudflare, then Google).
+                    DOH_SERVERS="https://cloudflare-dns.com/dns-query https://dns.google/dns-query"
+                    dl_file() {   # dl_file URL OUTPUT  -> 0 if downloaded (non-empty)
+                      local url="$1" out="$2" doh
+                      rm -f "$out"
+                      wget -q --tries=2 --timeout=60 -O "$out" "$url" 2>/dev/null && [ -s "$out" ] && return 0
+                      for doh in $DOH_SERVERS; do
+                        curl -fsSL --retry 2 --connect-timeout 20 --max-time 900 --doh-url "$doh" -o "$out" "$url" 2>/dev/null \
+                          && [ -s "$out" ] && return 0
+                      done
+                      rm -f "$out"; return 1
+                    }
+                    # Remembers a fingerprint (final URL without its time-limited signature + ETag +
+                    # Last-Modified + size) per download URL, so the weekly updater downloads a file
+                    # only when it really changed.
+                    FP_DIR=/var/lib/app-auto-update
+                    remote_fp() {
+                      local h doh
+                      h=$(curl -fsSIL --max-time 30 -w 'URL:%{url_effective}\n' "$1" 2>/dev/null) || h=""
+                      if [ -z "$h" ]; then
+                        for doh in $DOH_SERVERS; do
+                          h=$(curl -fsSIL --max-time 30 --doh-url "$doh" -w 'URL:%{url_effective}\n' "$1" 2>/dev/null) && break
+                        done
+                      fi
+                      [ -n "$h" ] || return 1
+                      printf '%s\n' "$h" | tr -d '\r' | sed -E 's/^(URL:[^?]*)\?.*/\1/' \
+                        | grep -iE '^(etag|last-modified|content-length|URL):' | sort | md5sum | cut -d' ' -f1
+                    }
+                    fp_key()  { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
+                    fp_changed() {   # true = changed or unknown -> download
+                      local new old
+                      new=$(remote_fp "$1") || return 0
+                      old=$(cat "$FP_DIR/$(fp_key "$1")" 2>/dev/null)
+                      [ "$new" != "$old" ]
+                    }
+                    fp_save() {
+                      local new
+                      new=$(remote_fp "$1") || return 0
+                      mkdir -p "$FP_DIR"; printf '%s\n' "$new" > "$FP_DIR/$(fp_key "$1")"
+                    }
+                - dest: /usr/local/sbin/telegram-install-update
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # Installs or updates official Telegram Desktop in /opt/Telegram.
+                    # Sources: telegram.org, fallback Telegram's official GitHub releases.
+                    # Only replaces the old version after the new one unpacked successfully.
+                    DEST="${TG_DEST:-/opt/Telegram}"
+                    LINK="${TG_LINK:-/usr/local/bin/telegram}"
+                    WORK=/var/cache/telegram-update
+                    mkdir -p "$WORK"
+
+                    tg_version() {   # file name -> version (works for tsetup.X.tar.xz and td-setup-linux-x64-X.tar.xz)
+                      basename "$1" | sed -E 's/\.tar\.xz$//' | grep -oE '[0-9]+(\.[0-9]+)+' | tail -n1
+                    }
+                    resolve_source() {   # prints: URL VERSION
+                      local real ver tag file
+                      real=$(curl -fsSL --max-time 60 -r 0-0 -o /dev/null -w '%{url_effective}' \
+                             https://telegram.org/dl/desktop/linux 2>/dev/null)
+                      if [[ "$real" == *.tar.xz ]]; then
+                        ver=$(tg_version "$real"); echo "$real ${ver:-unknown}"; return 0
+                      fi
+                      tag=$(curl -s --max-time 60 -o /dev/null -w '%{redirect_url}' \
+                            https://github.com/telegramdesktop/tdesktop/releases/latest | sed 's#.*/tag/##')
+                      [ -n "$tag" ] || return 1
+                      file=$(curl -fsSL --max-time 60 "https://github.com/telegramdesktop/tdesktop/releases/expanded_assets/$tag" \
+                             | grep -oE '/telegramdesktop/tdesktop/releases/download/[^"]+linux[^"]*\.tar\.xz' | head -n1)
+                      [ -n "$file" ] || return 1
+                      echo "https://github.com$file $(tg_version "$file")"
+                    }
+
+                    [ "${1:-}" = "--check" ] && { resolve_source; exit $?; }
+
+                    read -r URL NEW < <(resolve_source) || true
+                    [ -n "${URL:-}" ] || { echo "Telegram: no download source reachable (telegram.org and GitHub)"; exit 1; }
+                    CUR=$(cat "$DEST/.version" 2>/dev/null)
+                    mark_system_updated() {   # Telegram then skips its own updater and extra per-user launcher
+                      [ -d "$DEST" ] || return 0
+                      mkdir -p "$DEST/externalupdater.d"
+                      echo "$DEST/Telegram" > "$DEST/externalupdater.d/system"
+                    }
+                    if [ -x "$DEST/Telegram" ] && [ "$NEW" != "unknown" ] && [ "$NEW" = "$CUR" ]; then
+                      mark_system_updated
+                      echo "Telegram: up to date ($CUR)"; exit 0
+                    fi
+                    rm -rf "${WORK:?}"/*
+                    [ -f /usr/local/lib/app-update-fp.sh ] && . /usr/local/lib/app-update-fp.sh
+                    if type dl_file >/dev/null 2>&1; then dl_file "$URL" "$WORK/telegram.tar.xz"
+                    else wget -q --tries=3 --timeout=120 -O "$WORK/telegram.tar.xz" "$URL"; fi \
+                      || { echo "Telegram: download failed ($URL)"; exit 1; }
+                    mkdir -p "$WORK/new" && tar -xJf "$WORK/telegram.tar.xz" -C "$WORK/new" || { echo "Telegram: unpack failed"; exit 1; }
+                    [ -x "$WORK/new/Telegram/Telegram" ] || { echo "Telegram: unexpected archive layout"; exit 1; }
+                    rm -rf "$DEST.old"; [ -d "$DEST" ] && mv "$DEST" "$DEST.old"
+                    mv "$WORK/new/Telegram" "$DEST" && rm -rf "$DEST.old"
+                    echo "$NEW" > "$DEST/.version"
+                    mark_system_updated
+                    chown -R root:root "$DEST"; chmod -R go-w "$DEST"   # read-only for users: disables self-updater
+                    ln -sf "$DEST/Telegram" "$LINK"
+                    rm -rf "${WORK:?}"/*
+                    echo "Telegram: installed $NEW (was ${CUR:-none}) from $URL"
+              loop_control:
+                label: "{{ item.dest }}"
+
+            - name: App updater (never replaces an app that is open)
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/app-auto-update
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # Updates apps that have no apt repository (Zoom, Slack, Viber, OnlyOffice,
+                  # RustDesk, LocalSend, Tabby, WhatsApp, Telegram, OmaCal, WinBox). Only installs a NEWER version.
+                  # Never replaces an app while it is open (e.g. Zoom during a call): it is updated on a
+                  # later run (daily 07:15 + 12:00 and after boot) when the app is closed.
+                  export DEBIAN_FRONTEND=noninteractive
+                  LOG=/var/log/app-auto-update.log
+                  CACHE=/var/cache/app-auto-update
+                  mkdir -p "$CACHE"
+                  exec >>"$LOG" 2>&1
+                  echo "=== $(date '+%Y-%m-%d %H:%M') ==="
+                  . /usr/local/lib/app-update-fp.sh
+
+                  app_running() {   # app_running PACKAGE -> 0 if the app is open right now
+                    case "$1" in
+                      zoom) pgrep -x zoom ;;
+                      viber) pgrep -x Viber ;;
+                      onlyoffice-desktopeditors) pgrep -x DesktopEditors ;;
+                      rustdesk) pgrep -f 'rustdesk --cm' ;;          # a remote session is open (the service itself is ignored)
+                      slack-desktop|slack) pgrep -x slack ;;
+                      tabby-terminal|tabby) pgrep -x tabby ;;
+                      localsend*) pgrep -f localsend ;;
+                      wasistlos) pgrep -x wasistlos ;;
+                      omacal) pgrep -x omacal ;;
+                      winbox) pgrep -if winbox ;;
+                      *) pgrep -x "$1" ;;
+                    esac >/dev/null 2>&1
+                  }
+
+                  update_from_url() {
+                    local url="$1" f="$CACHE/upd.deb" pkg newv cur
+                    [ -n "$url" ] || return 0
+                    if ! fp_changed "$url"; then echo "unchanged, not downloaded: $(basename "$url")"; return 0; fi
+                    dl_file "$url" "$f" || { echo "download failed: $url"; return 0; }
+                    pkg=$(dpkg-deb -f "$f" Package 2>/dev/null); newv=$(dpkg-deb -f "$f" Version 2>/dev/null)
+                    if [ -z "$pkg" ]; then echo "not a .deb: $url"; rm -f "$f"; return 0; fi
+                    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                      echo "$pkg: not installed, skipped"; rm -f "$f"; return 0
+                    fi
+                    cur=$(dpkg-query -W -f='${Version}' "$pkg")
+                    if dpkg --compare-versions "$newv" gt "$cur" && app_running "$pkg"; then
+                      echo "$pkg: $newv available but the app is open - will update on a later run"
+                      rm -f "$f"; return 0                          # no fp_save: try again next run
+                    elif dpkg --compare-versions "$newv" gt "$cur"; then
+                      apt-get install -y -o Dpkg::Options::=--force-confold "$f" && echo "$pkg: updated $cur -> $newv"
+                    else
+                      echo "$pkg: up to date ($cur)"
+                    fi
+                    fp_save "$url"
+                    rm -f "$f"
+                  }
+                  winbox_url() {   # newest stable WinBox 4 .deb (tikoci/winbox-deb, packages MikroTik's official WinBox)
+                    local tag f
+                    tag=$(curl -s --max-time 60 -o /dev/null -w '%{redirect_url}' https://github.com/tikoci/winbox-deb/releases/latest | sed 's#.*/tag/##')
+                    if [ -n "$tag" ]; then
+                      f=$(curl -fsSL --max-time 60 "https://github.com/tikoci/winbox-deb/releases/expanded_assets/$tag" 2>/dev/null \
+                          | grep -oE '/tikoci/winbox-deb/releases/download/[^"]+/WinBox-[0-9][^"/]*\.deb' | head -n1)
+                      [ -n "$f" ] && { echo "https://github.com$f"; return 0; }
+                    fi
+                    echo "https://github.com/tikoci/winbox-deb/releases/download/4.0.1/WinBox-4.0.1.deb"
+                  }
+                  omacal_url() {   # newest OmaCal .deb (official x3me/omacal releases, github.com only, no API)
+                    local tag f
+                    tag=$(curl -s --max-time 60 -o /dev/null -w '%{redirect_url}' https://github.com/x3me/omacal/releases/latest | sed 's#.*/tag/##')
+                    if [ -n "$tag" ]; then
+                      f=$(curl -fsSL --max-time 60 "https://github.com/x3me/omacal/releases/expanded_assets/$tag" 2>/dev/null \
+                          | grep -oE '/x3me/omacal/releases/download/[^"]+/omacal_[0-9][^"/]*_amd64\.deb' | head -n1)
+                      [ -n "$f" ] && { echo "https://github.com$f"; return 0; }
+                    fi
+                    echo "https://github.com/x3me/omacal/releases/latest/download/omacal_amd64.deb"
+                  }
+                  gh_url() {
+                    curl -fsSL --max-time 60 "https://api.github.com/repos/$1/releases/latest" 2>/dev/null \
+                      | grep -oE "https://[^\"]+$2" | head -n1
+                  }
+
+                  update_from_url "https://zoom.us/client/latest/zoom_amd64.deb"
+                  update_from_url "https://download.cdn.viber.com/cdn/desktop/Linux/viber.deb"
+                  update_from_url "https://download.onlyoffice.com/install/desktop/editors/linux/onlyoffice-desktopeditors_amd64.deb"
+                  update_from_url "$(gh_url rustdesk/rustdesk 'x86_64\.deb')"
+                  update_from_url "$(gh_url localsend/localsend 'linux-x86-64\.deb')"
+                  update_from_url "$(gh_url Eugeny/tabby 'linux-x64\.deb')"
+
+                  SV=$(curl -fsSL --max-time 60 https://slack.com/release-notes/linux 2>/dev/null \
+                       | grep -oE 'Slack [0-9]+\.[0-9]+\.[0-9]+' | head -n1 | awk '{print $2}')
+                  [ -n "$SV" ] && update_from_url "https://downloads.slack-edge.com/desktop-releases/linux/x64/$SV/slack-desktop-$SV-amd64.deb"
+
+                  WA=$(curl -fsSL --max-time 60 http://deb.debian.org/debian/pool/main/w/wasistlos/ 2>/dev/null \
+                       | grep -oE 'wasistlos_[^"<>]+_amd64\.deb' | sort -uV | tail -n1)
+                  [ -n "$WA" ] && update_from_url "http://deb.debian.org/debian/pool/main/w/wasistlos/$WA"
+                  for f in /usr/share/applications/*[Ww]as[Ii]st[Ll]os*.desktop; do
+                    [ -f "$f" ] && sed -i 's/^Name=.*/Name=WhatsApp/' "$f"
+                  done
+                  dpkg -s omacal >/dev/null 2>&1 && update_from_url "$(omacal_url)"
+                  dpkg -s winbox >/dev/null 2>&1 && update_from_url "$(winbox_url)"
+                  if [ -x /usr/local/bin/starship ]; then
+                    st_new=$(curl -s --max-time 60 -o /dev/null -w '%{redirect_url}' https://github.com/starship/starship/releases/latest | sed 's#.*/tag/v##')
+                    st_cur=$(/usr/local/bin/starship --version 2>/dev/null | awk 'NR==1{print $2}')
+                    if [ -n "$st_new" ] && [ "$st_new" != "$st_cur" ]; then
+                      if dl_file "https://github.com/starship/starship/releases/download/v$st_new/starship-x86_64-unknown-linux-gnu.tar.gz" "$CACHE/starship.tgz" \
+                         && tar -xzf "$CACHE/starship.tgz" -C /usr/local/bin starship; then
+                        chmod 755 /usr/local/bin/starship; echo "starship: updated $st_cur -> $st_new"
+                      fi
+                      rm -f "$CACHE/starship.tgz"
+                    else
+                      echo "starship: up to date (${st_cur:-?})"
+                    fi
+                  fi
+                  [ -x /usr/local/sbin/telegram-install-update ] && [ -d /opt/Telegram ] && /usr/local/sbin/telegram-install-update
+                  exit 0
+
+            - name: Firmware updater (weekly, charger only, installs at the next restart)
+              ansible.builtin.copy:
+                dest: /usr/local/sbin/firmware-auto-update
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  # Installs firmware updates from LVFS. Safety: only on charger power and
+                  # battery >= 40%. BIOS updates are applied at the next reboot.
+                  LOG=/var/log/firmware-auto-update.log
+                  exec >>"$LOG" 2>&1
+                  echo "=== $(date '+%Y-%m-%d %H:%M') ==="
+                  AC="unknown"
+                  for ps in /sys/class/power_supply/*; do
+                    [ "$(cat "$ps/type" 2>/dev/null)" = "Mains" ] && AC=$(cat "$ps/online" 2>/dev/null)
+                  done
+                  if [ "$AC" = "0" ]; then echo "On battery - skipped"; exit 0; fi
+                  BAT=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -n1)
+                  if [ -n "$BAT" ] && [ "$BAT" -lt 40 ]; then echo "Battery $BAT% - skipped"; exit 0; fi
+                  fwupdmgr refresh --force >/dev/null 2>&1 || true
+                  if fwupdmgr get-updates --no-unreported-check >/dev/null 2>&1; then
+                    fwupdmgr update -y --no-reboot-check --no-unreported-check && \
+                      echo "Firmware updated - will finish at next reboot if needed"
+                  else
+                    echo "No firmware updates"
+                  fi
+                  exit 0
+
+            - name: update-status command (anyone can see that updates work)
+              ansible.builtin.copy:
+                dest: /usr/local/bin/update-status
+                mode: "0755"
+                content: !unsafe |
+                  #!/bin/bash
+                  echo "=== Automatic updates status ==="
+                  echo "Next system update check:"
+                  systemctl list-timers apt-daily-upgrade.timer --no-pager 2>/dev/null | sed -n 2p
+                  echo "Next app update:      $(systemctl list-timers app-auto-update.timer --no-pager 2>/dev/null | sed -n 2p | awk '{print $1,$2,$3}')"
+                  echo "Next firmware check:  $(systemctl list-timers firmware-auto-update.timer --no-pager 2>/dev/null | sed -n 2p | awk '{print $1,$2,$3}')"
+                  echo
+                  echo "Last system update:   $(ls -l --time-style=+'%Y-%m-%d %H:%M' /var/lib/apt/periodic/upgrade-stamp 2>/dev/null | awk '{print $6,$7}')"
+                  echo
+                  echo "--- Last app updates ---";      tail -n 12 /var/log/app-auto-update.log 2>/dev/null || echo "none yet"
+                  echo "--- Last firmware check ---";   tail -n 4 /var/log/firmware-auto-update.log 2>/dev/null || echo "none yet"
+                  echo
+                  if [ -f /etc/default/firstboot-apps ]; then
+                    echo "--- Apps installed after first boot ---"
+                    if [ -f /var/lib/custom-iso/firstboot-apps.done ]; then echo "all installed ($(cat /var/lib/custom-iso/firstboot-apps.done))"
+                    else echo "still installing / waiting for internet:"; tail -n 6 /var/log/firstboot-apps.log 2>/dev/null; fi
+                    echo
+                  fi
+                  [ -f /var/run/reboot-required ] && echo "!! Restart the laptop to finish installing updates." || echo "No restart needed."
+
+            - name: App and firmware update services and timers
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ item.name }}"
+                mode: "0644"
+                content: "{{ item.content }}"
+              loop:
+                - name: app-auto-update.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Update apps installed from .deb files (Zoom, Slack, Viber ...)
+                    After=network-online.target
+                    Wants=network-online.target
+
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/sbin/app-auto-update
+                    Nice=19
+                    IOSchedulingClass=idle
+                - name: app-auto-update.timer
+                  content: !unsafe |
+                    [Unit]
+                    Description=Update apps without a repository (daily; skips apps that are open)
+
+                    [Timer]
+                    OnBootSec=5min
+                    OnCalendar=*-*-* 07:15:00
+                    OnCalendar=*-*-* 12:00:00
+                    RandomizedDelaySec=15min
+                    Persistent=true
+
+                    [Install]
+                    WantedBy=timers.target
+                - name: firmware-auto-update.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Automatic firmware update (fwupd)
+                    After=network-online.target fwupd.service
+                    Wants=network-online.target
+
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/sbin/firmware-auto-update
+                - name: firmware-auto-update.timer
+                  content: !unsafe |
+                    [Unit]
+                    Description=Weekly firmware update check
+
+                    [Timer]
+                    OnCalendar=Wed *-*-* 13:00:00
+                    RandomizedDelaySec=1h
+                    Persistent=true
+
+                    [Install]
+                    WantedBy=timers.target
+              loop_control:
+                label: "{{ item.name }}"
+
+            - name: Update logs readable by everyone
+              ansible.builtin.file:
+                path: "{{ item }}"
+                state: touch
+                mode: "0644"
+                modification_time: preserve
+                access_time: preserve
+              loop: [/var/log/app-auto-update.log, /var/log/firmware-auto-update.log]
+
+            - name: Automatic updates on
+              ansible.builtin.systemd:
+                name: "{{ item }}"
+                enabled: true
+                state: started
+                daemon_reload: true
+              loop: [unattended-upgrades.service, apt-daily.timer, apt-daily-upgrade.timer, app-auto-update.timer, firmware-auto-update.timer]
+
+            - name: Firmware list refresh on
+              ansible.builtin.systemd:
+                name: fwupd-refresh.timer
+                enabled: true
+              failed_when: false
+
+            - name: Apply new update check times now
+              ansible.builtin.command: systemctl restart apt-daily.timer apt-daily-upgrade.timer
+              when: r_apt_timers.changed
+              changed_when: true
+
+            # ================ 16. restart twice a week (Sun + Thu 07:00), notices, 7-day logs ================
+            - name: Maintenance settings (an existing file is kept)
+              ansible.builtin.copy:
+                dest: /etc/default/excitel-maintenance
+                mode: "0644"
+                force: false
+                content: !unsafe |
+                  # Excitel maintenance settings (applied with: sudo excitel-maintenance apply)
+                  REBOOT_DAYS="Sun,Thu"        # scheduled restart days
+                  REBOOT_TIME="07:00"          # outside working hours
+                  WORK_START=8                 # working hours start (hour)
+                  WORK_END=22                  # working hours end (hour)
+                  WARN_MINUTES=5               # warning before a restart outside working hours
+                  CATCHUP_WARN_MINUTES=15      # warning before a missed restart during working hours
+                  POSTPONE_MINUTES=60          # "Postpone 1 hour" button
+                  MIN_UPTIME_HOURS=12          # skip if the laptop was restarted recently
+
+            - name: Maintenance folders
+              ansible.builtin.file:
+                path: "{{ item.path }}"
+                state: directory
+                owner: root
+                group: "{{ item.group }}"
+                mode: "{{ item.mode }}"
+              loop:
+                - { path: /var/log/excitel, group: adm, mode: "0750" }
+                - { path: /var/lib/excitel-notice, group: root, mode: "0755" }
+                - { path: /usr/lib/systemd/system-sleep, group: root, mode: "0755" }
+
+            - name: Maintenance tools (notices, restarts, logs)
+              ansible.builtin.copy:
+                dest: "{{ item.dest }}"
+                mode: "{{ item.mode }}"
+                content: "{{ item.content }}"
+              loop:
+                - dest: /usr/local/sbin/excitel-notify
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # excitel-notify users                  -> list active desktop users (exit 1 if none)
+                    # excitel-notify info TITLE BODY        -> desktop notification for every active user
+                    # excitel-notify run COMMAND...        -> start COMMAND in every active desktop session
+                    # excitel-notify ask TITLE BODY SECONDS -> dialog [Restart now] [Postpone 1 hour];
+                    #                                         exit 10 = postponed, 0 = restart (or timeout)
+                    sessions() {   # prints: user uid display home
+                      local s user type active class disp uid home
+                      for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+                        class=$(loginctl show-session "$s" -p Class --value 2>/dev/null)
+                        active=$(loginctl show-session "$s" -p Active --value 2>/dev/null)
+                        type=$(loginctl show-session "$s" -p Type --value 2>/dev/null)
+                        [ "$class" = "user" ] && [ "$active" = "yes" ] || continue
+                        case "$type" in x11|wayland) ;; *) continue ;; esac
+                        user=$(loginctl show-session "$s" -p Name --value 2>/dev/null)
+                        disp=$(loginctl show-session "$s" -p Display --value 2>/dev/null)
+                        uid=$(id -u "$user" 2>/dev/null) || continue
+                        home=$(getent passwd "$user" | cut -d: -f6)
+                        echo "$user $uid ${disp:-:0} $home"
+                      done | sort -u
+                    }
+                    as_user() {   # $1 user $2 uid $3 display $4 home, then command
+                      local u="$1" uid="$2" d="$3" h="$4"; shift 4
+                      runuser -u "$u" -- env HOME="$h" USER="$u" DISPLAY="$d" XAUTHORITY="$h/.Xauthority" \
+                        XDG_RUNTIME_DIR="/run/user/$uid" XDG_CURRENT_DESKTOP="X-Cinnamon" \
+                        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+                    }
+                    case "${1:-}" in
+                      users)
+                        out=$(sessions | awk '{print $1}' | tr '\n' ' ' | sed 's/ $//')
+                        [ -n "$out" ] && { echo "$out"; exit 0; } || exit 1 ;;
+                      info)
+                        sessions | while read -r u uid d h; do
+                          as_user "$u" "$uid" "$d" "$h" notify-send -a "Excitel IT" -i system-software-update -u normal "$2" "$3" 2>/dev/null &
+                        done; wait; exit 0 ;;
+                      run)
+                        shift
+                        sessions | while read -r u uid d h; do
+                          as_user "$u" "$uid" "$d" "$h" setsid -f "$@" >/dev/null 2>&1 < /dev/null
+                        done; exit 0 ;;
+                      ask)
+                        read -r u uid d h < <(sessions | head -n1)
+                        [ -n "${u:-}" ] || exit 2
+                        if command -v zenity >/dev/null; then
+                          as_user "$u" "$uid" "$d" "$h" zenity --question --title="$2" --text="$3" \
+                            --ok-label="Restart now" --cancel-label="Postpone 1 hour" --timeout="$4" --width=440 2>/dev/null
+                          rc=$?
+                          [ "$rc" -eq 1 ] && exit 10      # Postpone pressed (or dialog closed)
+                          exit 0                          # Restart now, or timeout
+                        fi
+                        as_user "$u" "$uid" "$d" "$h" notify-send -a "Excitel IT" -u critical "$2" "$3" 2>/dev/null
+                        sleep "$4"; exit 0 ;;
+                      *) echo "usage: excitel-notify users | info TITLE BODY | run COMMAND | ask TITLE BODY SECONDS"; exit 1 ;;
+                    esac
+                - dest: /usr/local/bin/ensure-nemo-desktop
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # ensure-nemo-desktop          -> start the desktop icons (nemo-desktop) if they stopped
+                    # ensure-nemo-desktop --watch  -> check every 2 minutes during this login session
+                    check() {
+                      local uid layout
+                      uid=$(id -u)
+                      pgrep -u "$uid" -x cinnamon >/dev/null || return 0               # no Cinnamon desktop (yet)
+                      layout=$(gsettings get org.nemo.desktop desktop-layout 2>/dev/null)
+                      layout=${layout//\'/}
+                      [ "${layout%%:*}" = "false" ] && return 0                        # desktop icons switched off
+                      pgrep -u "$uid" -x nemo-desktop >/dev/null && return 0           # running - nothing to do
+                      setsid -f nemo-desktop >/dev/null 2>&1 < /dev/null
+                      logger -t ensure-nemo-desktop "desktop icons (nemo-desktop) were not running for ${USER:-$(id -un)} - started again"
+                    }
+                    if [ "${1:-}" = "--watch" ]; then
+                      LOCK="${XDG_RUNTIME_DIR:-/tmp}/ensure-nemo-desktop.lock"
+                      exec 9>"$LOCK"
+                      flock -n 9 || exit 0                                             # one watcher per session
+                      sleep 45                                                         # Cinnamon starts it itself first
+                      while [ -e "$LOCK" ]; do check; sleep 120; done                  # ends when the user logs out
+                      exit 0
+                    fi
+                    check
+                - dest: /etc/xdg/autostart/ensure-nemo-desktop.desktop
+                  mode: "0644"
+                  content: !unsafe |
+                    [Desktop Entry]
+                    Type=Application
+                    Name=Desktop icons check
+                    Exec=/usr/local/bin/ensure-nemo-desktop --watch
+                    OnlyShowIn=X-Cinnamon;
+                    NoDisplay=true
+                    X-GNOME-Autostart-enabled=true
+                - dest: /etc/apt/apt.conf.d/99ensure-nemo-desktop
+                  mode: "0644"
+                  content: !unsafe |
+                    DPkg::Post-Invoke { "[ -x /usr/local/sbin/excitel-notify ] && systemd-run --quiet --collect --on-active=20s /usr/local/sbin/excitel-notify run /usr/local/bin/ensure-nemo-desktop >/dev/null 2>&1 || true"; };
+                - dest: /usr/local/sbin/excitel-reboot
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # excitel-reboot scheduled   (Sun+Thu 7:00, wakes the laptop from sleep)
+                    # excitel-reboot required    (daily 7:00: only if a security update needs a restart)
+                    # excitel-reboot catchup     (after resume, if a restart was skipped in a bag; outside working
+                    #                             hours only - otherwise the next 7:00 'required' run does it)
+                    # excitel-reboot postponed   (1 hour after "Postpone")
+                    . /etc/default/excitel-maintenance 2>/dev/null
+                    WORK_START=${WORK_START:-8}; WORK_END=${WORK_END:-22}; WARN_MINUTES=${WARN_MINUTES:-5}
+                    CATCHUP_WARN_MINUTES=${CATCHUP_WARN_MINUTES:-15}; POSTPONE_MINUTES=${POSTPONE_MINUTES:-60}
+                    MIN_UPTIME_HOURS=${MIN_UPTIME_HOURS:-12}; REBOOT_DAYS=${REBOOT_DAYS:-Sun,Thu}
+                    MODE="${1:-scheduled}"
+                    /usr/local/sbin/not-live-session || exit 0
+                    ST=/var/lib/custom-iso; NOTE=/var/lib/excitel-notice; mkdir -p "$ST" "$NOTE" /var/log/excitel
+                    LOG="/var/log/excitel/reboot-$(date +%F).log"
+                    log() { echo "$(date '+%F %T') [$MODE] $*" >> "$LOG"; }
+                    up=$(cut -d. -f1 /proc/uptime); hour=$(date +%-H)
+                    in_work_hours() { [ "$hour" -ge "$WORK_START" ] && [ "$hour" -lt "$WORK_END" ]; }
+                    on_ac() {
+                      local p bat=0
+                      for p in /sys/class/power_supply/*; do
+                        [ "$(cat "$p/type" 2>/dev/null)" = "Battery" ] && bat=1
+                        [ "$(cat "$p/type" 2>/dev/null)" = "Mains" ] && [ "$(cat "$p/online" 2>/dev/null)" = "1" ] && return 0
+                      done
+                      [ "$bat" = 0 ]          # no battery (desktop/VM) counts as power connected
+                    }
+                    lid_closed() { grep -qs closed /proc/acpi/button/lid/*/state; }
+
+                    case "$MODE" in
+                      required)
+                        [ -f /run/reboot-required ] || [ -f "$ST/reboot-pending" ] || exit 0
+                        [[ ",$REBOOT_DAYS," == *",$(LC_ALL=C date +%a),"* ]] && exit 0     # scheduled restart today anyway
+                        if in_work_hours; then log "restart needed - waiting for the next morning (working hours)"; exit 0; fi ;;
+                      catchup)  [ -f "$ST/reboot-pending" ] || exit 0
+                        if in_work_hours; then log "skipped restart pending - waiting for the next morning (working hours)"; exit 0; fi ;;
+                      scheduled|postponed) ;;
+                      *) echo "usage: excitel-reboot scheduled|required|catchup|postponed"; exit 1 ;;
+                    esac
+                    if [ "$MODE" != "postponed" ] && [ "$up" -lt $((MIN_UPTIME_HOURS * 3600)) ]; then
+                      log "skipped: laptop restarted $((up / 60)) minutes ago"; rm -f "$ST/reboot-pending"; exit 0
+                    fi
+                    if lid_closed && ! on_ac; then
+                      log "skipped: on battery with lid closed (e.g. in a bag) - back to sleep, restart later"
+                      touch "$ST/reboot-pending"; systemctl suspend; exit 0
+                    fi
+                    users=$(/usr/local/sbin/excitel-notify users 2>/dev/null)
+                    if [ -n "$users" ]; then
+                      if in_work_hours; then secs=$((CATCHUP_WARN_MINUTES * 60)); else secs=$((WARN_MINUTES * 60)); fi
+                      mins=$((secs / 60))
+                      title="Excitel IT – Scheduled maintenance"
+                      if [ "$MODE" = "postponed" ]; then
+                        log "postponed restart: warning $users ($mins min)"
+                        /usr/local/sbin/excitel-notify info "$title" "Your laptop will restart in $mins minutes (postponed restart). Please save your work now."
+                        sleep "$secs"
+                      else
+                        log "warning $users ($mins min)"
+                        /usr/local/sbin/excitel-notify ask "$title" "Your laptop will restart in $mins minutes to finish installing updates.
+                    Please save your work now." "$secs"
+                        if [ $? -eq 10 ]; then
+                          log "postponed ${POSTPONE_MINUTES} min by user"
+                          systemd-run --quiet --collect --unit="excitel-reboot-postponed-$(date +%s)" \
+                            --on-active="${POSTPONE_MINUTES}m" /usr/local/sbin/excitel-reboot postponed >/dev/null 2>&1
+                          exit 0
+                        fi
+                      fi
+                    fi
+                    log "restarting now (users: ${users:-none}, uptime $((up / 3600)) h)"
+                    rm -f "$ST/reboot-pending"
+                    printf '%s\n%s\n' "$(date '+%F %T')" "${users:-none}" > "$ST/scheduled-reboot"
+                    sync; systemctl reboot
+                - dest: /usr/local/sbin/excitel-after-reboot
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    /usr/local/sbin/not-live-session || exit 0
+                    ST=/var/lib/custom-iso; NOTE=/var/lib/excitel-notice; mkdir -p "$NOTE" /var/log/excitel
+                    LOG="/var/log/excitel/reboot-$(date +%F).log"
+                    if [ "${1:-}" = "idle-check" ]; then
+                      if ! /usr/local/sbin/excitel-notify users >/dev/null 2>&1; then
+                        echo "$(date '+%F %T') [after-reboot] nobody logged in 15 min after maintenance restart - sleep" >> "$LOG"
+                        systemctl suspend
+                      fi
+                      exit 0
+                    fi
+                    rm -f "$ST/reboot-pending"                     # any fresh boot = restart done
+                    [ -f "$ST/scheduled-reboot" ] || exit 0
+                    users=$(sed -n 2p "$ST/scheduled-reboot")
+                    apps=$(cat "$ST/updates-since-reboot" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+                    { echo "BOOT=$(cat /proc/sys/kernel/random/boot_id)"
+                      echo "TITLE=Excitel IT – Updates completed ✓"
+                      if [ -n "$apps" ]; then echo "BODY=Your laptop is up to date. Updated: $apps."
+                      else echo "BODY=Your laptop is up to date."; fi
+                    } > "$NOTE/login-notice"
+                    chmod 644 "$NOTE/login-notice"
+                    rm -f "$ST/scheduled-reboot" "$ST/updates-since-reboot"
+                    echo "$(date '+%F %T') [after-reboot] maintenance restart finished" >> "$LOG"
+                    if [ "$users" = "none" ]; then              # laptop was idle/asleep before: sleep again if unused
+                      systemd-run --quiet --collect --unit="excitel-idle-check-$(date +%s)" --on-active=15m \
+                        /usr/local/sbin/excitel-after-reboot idle-check >/dev/null 2>&1
+                    fi
+                    exit 0
+                - dest: /usr/local/bin/excitel-login-notice
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    N=/var/lib/excitel-notice/login-notice
+                    [ -r "$N" ] || exit 0
+                    boot=$(grep -oP '^BOOT=\K.*' "$N"); [ "$boot" = "$(cat /proc/sys/kernel/random/boot_id)" ] || exit 0
+                    seen="$HOME/.config/custom-iso/login-notice-seen"
+                    [ "$(cat "$seen" 2>/dev/null)" = "$boot" ] && exit 0
+                    sleep 20
+                    notify-send -a "Excitel IT" -i system-software-update "$(grep -oP '^TITLE=\K.*' "$N")" "$(grep -oP '^BODY=\K.*' "$N")" 2>/dev/null
+                    mkdir -p "$(dirname "$seen")"; echo "$boot" > "$seen"
+                - dest: /etc/xdg/autostart/excitel-login-notice.desktop
+                  mode: "0644"
+                  content: !unsafe |
+                    [Desktop Entry]
+                    Type=Application
+                    Name=Excitel IT notices
+                    Exec=/usr/local/bin/excitel-login-notice
+                    NoDisplay=true
+                    X-GNOME-Autostart-enabled=true
+                - dest: /usr/lib/systemd/system-sleep/excitel-reboot-catchup
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/sh
+                    [ "$1" = "post" ] || exit 0
+                    [ -f /var/lib/custom-iso/reboot-pending ] || exit 0
+                    systemctl start --no-block excitel-reboot-catchup.service
+                    exit 0
+                - dest: /usr/local/sbin/excitel-maintenance
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # excitel-maintenance status   -> next restarts, last restart log, log folder size
+                    # excitel-maintenance apply    -> re-read /etc/default/excitel-maintenance (days/time)
+                    . /etc/default/excitel-maintenance
+                    case "${1:-status}" in
+                      apply)
+                        [ "$(id -u)" -eq 0 ] || { echo "Run with sudo."; exit 1; }
+                        sed -i "s|^OnCalendar=.*|OnCalendar=$REBOOT_DAYS *-*-* $REBOOT_TIME:00|; s|^Description=Excitel maintenance restart (.*|Description=Excitel maintenance restart ($REBOOT_DAYS $REBOOT_TIME)|" /etc/systemd/system/excitel-reboot.timer
+                        sed -i "s|^OnCalendar=.*|OnCalendar=*-*-* $REBOOT_TIME:00|" /etc/systemd/system/excitel-reboot-required.timer
+                        systemctl daemon-reload; systemctl restart excitel-reboot.timer excitel-reboot-required.timer
+                        echo "Applied: restart $REBOOT_DAYS $REBOOT_TIME, working hours $WORK_START-$WORK_END" ;;
+                      status)
+                        systemctl list-timers excitel-reboot.timer excitel-reboot-required.timer --no-pager 2>/dev/null | head -4
+                        echo; echo "Restart needed for updates: $([ -f /run/reboot-required ] && echo yes || echo no)"
+                        echo "Last restart log:"; ls -1t /var/log/excitel/reboot-*.log 2>/dev/null | head -1 | xargs -r tail -n 5
+                        echo; echo "Log folder: $(du -sh /var/log/excitel 2>/dev/null | cut -f1) in /var/log/excitel" ;;
+                      *) echo "usage: excitel-maintenance status | apply" ;;
+                    esac
+                - dest: /usr/local/sbin/excitel-update-notify
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # Every 30 min: reads new entries of the apt history and app-updater log, writes
+                    # /var/log/excitel/updates-<date>.log and tells logged-in users during working hours.
+                    /usr/local/sbin/not-live-session || exit 0
+                    . /etc/default/excitel-maintenance 2>/dev/null
+                    WORK_START=${WORK_START:-8}; WORK_END=${WORK_END:-22}; REBOOT_TIME=${REBOOT_TIME:-07:00}
+                    ST=/var/lib/custom-iso; mkdir -p "$ST" /var/log/excitel
+                    LOG="/var/log/excitel/updates-$(date +%F).log"
+                    QUEUE="$ST/notify-queue"
+                    new_part() {   # $1 file, $2 offset-state -> prints only new text since last run
+                      local f="$1" o="$2" size off
+                      [ -f "$f" ] || return 0
+                      size=$(stat -c %s "$f"); off=$(cat "$o" 2>/dev/null || echo "$size")   # first run: no old news
+                      [ "$size" -lt "$off" ] && off=0                                       # log was rotated
+                      echo "$size" > "$o"
+                      tail -c +$((off + 1)) "$f"
+                    }
+                    friendly() {
+                      case "$1" in
+                        google-chrome-stable) echo "Google Chrome" ;; firefox) echo "Firefox" ;; code) echo "VS Code" ;;
+                        zoom) echo "Zoom" ;; slack-desktop) echo "Slack" ;; viber) echo "Viber" ;;
+                        onlyoffice-desktopeditors) echo "OnlyOffice" ;; rustdesk) echo "RustDesk" ;; localsend) echo "LocalSend" ;;
+                        tabby-terminal) echo "Tabby" ;; wasistlos) echo "WhatsApp" ;; omacal) echo "OmaCal" ;; winbox) echo "WinBox" ;;
+                        ghostty) echo "Ghostty" ;; libreoffice-core) echo "LibreOffice" ;; wireshark-qt|wireshark) echo "Wireshark" ;;
+                        filezilla) echo "FileZilla" ;; vlc) echo "VLC" ;; gimp) echo "GIMP" ;; inkscape) echo "Inkscape" ;;
+                        putty) echo "PuTTY" ;; remmina) echo "Remmina" ;;
+                      esac
+                    }
+                    hist=$(new_part /var/log/apt/history.log "$ST/apt-history.offset")
+                    appl=$(new_part /var/log/app-auto-update.log "$ST/app-update.offset")
+                    pkgs=$(printf '%s\n' "$hist" | grep -E '^(Upgrade|Install):' | sed -E 's/^[A-Za-z]+: //' \
+                           | sed -E 's/\), /)\n/g' | sed -E 's/^ *([^: ]+).*/\1/' | sort -u)
+                    apps=""
+                    for p in $pkgs; do n=$(friendly "$p"); [ -n "$n" ] && apps="$apps$n"$'\n'; done
+                    printf '%s\n' "$appl" | grep -q '^Telegram: installed' && apps="${apps}Telegram"$'\n'
+                    apps=$(printf '%s' "$apps" | sed '/^$/d' | sort -u)
+                    n_pkgs=$(printf '%s\n' "$pkgs" | sed '/^$/d' | wc -l)
+                    if [ "$n_pkgs" -gt 0 ] || [ -n "$apps" ]; then
+                      { echo "$(date '+%F %T') updated packages: $n_pkgs"
+                        [ -n "$apps" ] && echo "  apps: $(printf '%s' "$apps" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+                        printf '%s\n' "$pkgs" | sed '/^$/d' | sed 's/^/  - /'
+                      } >> "$LOG"
+                      [ -n "$apps" ] && { printf '%s\n' "$apps" >> "$ST/updates-since-reboot"; printf '%s\n' "$apps" >> "$QUEUE"; }
+                    fi
+                    # Security update needs a restart: tell users once per boot
+                    boot=$(cat /proc/sys/kernel/random/boot_id)
+                    if [ -f /run/reboot-required ] && [ "$(cat "$ST/reboot-notice-boot" 2>/dev/null)" != "$boot" ]; then
+                      echo "$(date '+%F %T') restart required: $(tr '\n' ' ' < /run/reboot-required.pkgs 2>/dev/null)" >> "$LOG"
+                      echo "__REBOOT__" >> "$QUEUE"
+                      echo "$boot" > "$ST/reboot-notice-boot"
+                    fi
+                    # Deliver queued notices only during working hours to someone logged in
+                    hour=$(date +%-H)
+                    [ -s "$QUEUE" ] || exit 0
+                    [ "$hour" -ge "$WORK_START" ] && [ "$hour" -lt "$WORK_END" ] || exit 0
+                    /usr/local/sbin/excitel-notify users >/dev/null 2>&1 || exit 0
+                    q_apps=$(grep -v '^__REBOOT__$' "$QUEUE" | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+                    if [ -n "$q_apps" ]; then
+                      /usr/local/sbin/excitel-notify info "Excitel IT – App updated" \
+                        "Updated: $q_apps. Restart the app to use the new version."
+                    fi
+                    if grep -qx '__REBOOT__' "$QUEUE" && [ -f /run/reboot-required ]; then
+                      /usr/local/sbin/excitel-notify info "Excitel IT – Restart needed" \
+                        "Important security updates were installed. Your laptop will restart tomorrow at $REBOOT_TIME, or restart it yourself at a convenient time."
+                    fi
+                    : > "$QUEUE"
+                    exit 0
+                - dest: /usr/local/sbin/excitel-logs
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # excitel-logs        (every 15 min) health, Chrome, graphics, hangs; 7-day retention
+                    # excitel-logs boot   (once per boot)  boot time, slow and failed services
+                    /usr/local/sbin/not-live-session || exit 0
+                    D=/var/log/excitel; ST=/var/lib/custom-iso; mkdir -p "$D" "$ST"
+                    day=$(date +%F); ts=$(date '+%F %T'); now=$(date +%s)
+                    if [ "${1:-}" = "boot" ]; then
+                      { echo "===== $ts boot $(cat /proc/sys/kernel/random/boot_id)"
+                        systemd-analyze 2>/dev/null | head -2
+                        echo "-- slowest services:"; systemd-analyze blame --no-pager 2>/dev/null | head -10
+                        echo "-- failed services:"; systemctl --failed --no-legend --no-pager 2>/dev/null || true
+                        echo "-- kernel: $(uname -r)   cmdline: $(cat /proc/cmdline)"
+                      } >> "$D/boot-$day.log"
+                      exit 0
+                    fi
+                    last=$(cat "$ST/logs.lastrun" 2>/dev/null || echo $((now - 900))); echo "$now" > "$ST/logs.lastrun"
+                    since="@$last"
+                    # 1) system health (RAM, zram, pressure, load, temperature, CPU speed)
+                    read -r ram_used ram_avail < <(free -m | awk '/^Mem:/{print $3, $7}')
+                    zr=$(zramctl --noheadings --raw --output DATA,COMPR,DISKSIZE 2>/dev/null | head -n1)
+                    pm=$(awk '/^some/{sub("avg10=","",$2); print $2}' /proc/pressure/memory 2>/dev/null)
+                    pio=$(awk '/^some/{sub("avg10=","",$2); print $2}' /proc/pressure/io 2>/dev/null)
+                    temp=$(for z in /sys/class/thermal/thermal_zone*; do t=$(cat "$z/temp" 2>/dev/null) && echo $((t / 1000)); done | sort -n | tail -1)
+                    echo "$ts ram_used=${ram_used}MB ram_avail=${ram_avail}MB zram=[${zr:-none}] mem_pressure=${pm:-?} io_pressure=${pio:-?} load=$(cut -d' ' -f1 /proc/loadavg) temp=${temp:-?}C" >> "$D/system-health-$day.log"
+                    # 2) Chrome: processes, memory, acceleration state, crashes
+                    cprocs=$(pgrep -c -x chrome 2>/dev/null); cprocs=${cprocs:-0}   # pgrep prints 0 itself when none
+                    cmem=$(ps -C chrome -o rss= 2>/dev/null | awk '{s+=$1} END {printf "%d", s/1024}')
+                    echo "$ts chrome_processes=$cprocs chrome_mem=${cmem:-0}MB $(/usr/local/sbin/chrome-gpu status 2>/dev/null)" >> "$D/chrome-$day.log"
+                    journalctl --since "$since" -q --no-pager 2>/dev/null | grep -iE 'chrome.*(segfault|crash|core dump|gpu process)|coredump.*chrome' >> "$D/chrome-$day.log"
+                    # 3) graphics / display / driver (flicker, frozen screen, GPU hangs, PSR)
+                    journalctl -k --since "$since" -q --no-pager 2>/dev/null \
+                      | grep -iE 'i915|xe |drm|psr|gpu hang|edp|vblank|flip_done|atomic commit|hdmi|displayport' >> "$D/graphics-$day.log"
+                    # 4) hangs: memory killer, blocked tasks, lockups, high pressure
+                    journalctl --since "$since" -q --no-pager 2>/dev/null \
+                      | grep -iE 'earlyoom.*(sending|low memory)|blocked for more than|hung_task|oom-kill|out of memory|soft lockup|watchdog: BUG|ensure-nemo-desktop' >> "$D/hangs-$day.log"
+                    awk -v p="${pm:-0}" 'BEGIN{exit !(p > 10)}' && echo "$ts high memory pressure ${pm} (laptop slow)" >> "$D/hangs-$day.log"
+                    # 5) keep only 7 days, max 200 MB
+                    find "$D" -maxdepth 1 -type f \( -name '*.log' -o -name 'support-*.tar.gz' \) -mtime +6 -delete 2>/dev/null
+                    while [ "$(du -sm "$D" | cut -f1)" -gt 200 ]; do
+                      oldest=$(ls -1tr "$D"/* 2>/dev/null | head -n1); [ -n "$oldest" ] || break; rm -f "$oldest"
+                    done
+                    chmod 640 "$D"/*.log 2>/dev/null; chgrp adm "$D"/*.log 2>/dev/null
+                    exit 0
+                - dest: /usr/local/sbin/laptop-logs
+                  mode: "0755"
+                  content: !unsafe |
+                    #!/bin/bash
+                    # laptop-logs collect  -> /var/log/excitel/support-<laptop>-<date>.tar.gz (prints the path)
+                    # laptop-logs status   -> what is in the log folder
+                    D=/var/log/excitel
+                    case "${1:-status}" in
+                      collect)
+                        [ "$(id -u)" -eq 0 ] || { echo "Run with sudo."; exit 1; }
+                        host=$(hostname); out="$D/support-$host-$(date +%F-%H%M).tar.gz"
+                        tmp=$(mktemp -d)
+                        { echo "laptop: $host   model: $(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+                          echo "date: $(date)   uptime: $(uptime -p)"; . /etc/os-release; echo "os: $PRETTY_NAME   kernel: $(uname -r)"
+                          echo "cmdline: $(cat /proc/cmdline)"
+                          echo; lspci -k 2>/dev/null | grep -iA3 'vga\|display'
+                          echo; free -h; echo; zramctl 2>/dev/null; swapon --show 2>/dev/null
+                          echo; lsblk -d -o NAME,ROTA,SIZE,MODEL 2>/dev/null
+                          echo; /usr/local/sbin/chrome-gpu status 2>/dev/null
+                          echo; systemctl --failed --no-pager 2>/dev/null
+                        } > "$tmp/system-info.txt" 2>&1
+                        journalctl --since "-7 days" -p warning -q --no-pager 2>/dev/null | tail -c 20000000 > "$tmp/journal-warnings-7days.txt"
+                        files=()
+                        for f in "$D"/*.log /var/log/browser-health /var/log/app-auto-update.log /var/log/firmware-auto-update.log \
+                                 /var/log/firstboot-apps.log /var/log/custom-iso-setup.log; do [ -e "$f" ] && files+=("$f"); done
+                        tar -czf "$out" --ignore-failed-read -C "$tmp" system-info.txt journal-warnings-7days.txt "${files[@]}" 2>/dev/null
+                        rm -rf "$tmp"
+                        ls -1t "$D"/support-*.tar.gz 2>/dev/null | tail -n +4 | xargs -r rm -f       # keep the 3 newest
+                        echo "$out" ;;
+                      status)
+                        echo "Log folder /var/log/excitel ($(du -sh $D 2>/dev/null | cut -f1)), kept 7 days:"
+                        ls -1 "$D" 2>/dev/null | sed 's/-20[0-9-]*\.log$//' | sort | uniq -c | sed 's/^/  /' ;;
+                      *) echo "usage: sudo laptop-logs collect | status" ;;
+                    esac
+              loop_control:
+                label: "{{ item.dest }}"
+
+            - name: Maintenance services
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ item.name }}"
+                mode: "0644"
+                content: "{{ item.content }}"
+              loop:
+                - name: excitel-reboot.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel scheduled maintenance restart
+
+                    [Service]
+                    Type=oneshot
+                    ExecCondition=/usr/local/sbin/not-live-session
+                    ExecStart=/usr/local/sbin/excitel-reboot scheduled
+                - name: excitel-reboot-required.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel restart for security updates (next morning)
+
+                    [Service]
+                    Type=oneshot
+                    ExecCondition=/usr/local/sbin/not-live-session
+                    ExecStart=/usr/local/sbin/excitel-reboot required
+                - name: excitel-reboot-catchup.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel maintenance restart skipped earlier (catch-up after resume)
+
+                    [Service]
+                    Type=oneshot
+                    ExecCondition=/usr/local/sbin/not-live-session
+                    ExecStartPre=/bin/sleep 60
+                    ExecStart=/usr/local/sbin/excitel-reboot catchup
+                - name: excitel-after-reboot.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel after-restart notice
+                    After=local-fs.target
+
+                    [Service]
+                    Type=oneshot
+                    ExecCondition=/usr/local/sbin/not-live-session
+                    ExecStart=/usr/local/sbin/excitel-after-reboot
+                    RemainAfterExit=yes
+
+                    [Install]
+                    WantedBy=multi-user.target
+                - name: excitel-update-notify.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel update notices and updates log
+
+                    [Service]
+                    Type=oneshot
+                    ExecCondition=/usr/local/sbin/not-live-session
+                    ExecStart=/usr/local/sbin/excitel-update-notify
+                    Nice=19
+                    IOSchedulingClass=idle
+                - name: excitel-update-notify.timer
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel update notices (every 30 min)
+
+                    [Timer]
+                    OnBootSec=10min
+                    OnUnitActiveSec=30min
+
+                    [Install]
+                    WantedBy=timers.target
+                - name: excitel-logs.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel troubleshooting logs (7 days)
+
+                    [Service]
+                    Type=oneshot
+                    ExecCondition=/usr/local/sbin/not-live-session
+                    ExecStart=/usr/local/sbin/excitel-logs
+                    Nice=19
+                    IOSchedulingClass=idle
+                - name: excitel-logs.timer
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel troubleshooting logs (every 15 min)
+
+                    [Timer]
+                    OnBootSec=5min
+                    OnUnitActiveSec=15min
+
+                    [Install]
+                    WantedBy=timers.target
+                - name: excitel-logs-boot.service
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel boot log
+
+                    [Service]
+                    Type=oneshot
+                    ExecCondition=/usr/local/sbin/not-live-session
+                    ExecStart=/usr/local/sbin/excitel-logs boot
+                    Nice=19
+                    IOSchedulingClass=idle
+                - name: excitel-logs-boot.timer
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel boot log (3 min after boot)
+
+                    [Timer]
+                    OnBootSec=3min
+
+                    [Install]
+                    WantedBy=timers.target
+              loop_control:
+                label: "{{ item.name }}"
+
+            - name: Restart timers (Sun + Thu 07:00, daily 07:00 if needed; existing days/time kept)
+              ansible.builtin.copy:
+                dest: "/etc/systemd/system/{{ item.name }}"
+                mode: "0644"
+                force: false
+                content: "{{ item.content }}"
+              loop:
+                - name: excitel-reboot.timer
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel maintenance restart (Sun,Thu 07:00)
+
+                    [Timer]
+                    OnCalendar=Sun,Thu *-*-* 07:00:00
+                    WakeSystem=true
+                    AccuracySec=1min
+
+                    [Install]
+                    WantedBy=timers.target
+                - name: excitel-reboot-required.timer
+                  content: !unsafe |
+                    [Unit]
+                    Description=Excitel restart for security updates (daily 07:00, only if needed)
+
+                    [Timer]
+                    OnCalendar=*-*-* 07:00:00
+                    AccuracySec=1min
+
+                    [Install]
+                    WantedBy=timers.target
+              loop_control:
+                label: "{{ item.name }}"
+
+            - name: Old boot entry for logs off (as in custom-iso-setup.sh)
+              ansible.builtin.command: systemctl disable excitel-logs-boot.service
+              changed_when: false
+              failed_when: false
+
+            - name: Maintenance timers on
+              ansible.builtin.systemd:
+                name: "{{ item }}"
+                enabled: true
+                state: started
+                daemon_reload: true
+              loop: [excitel-reboot.timer, excitel-reboot-required.timer, excitel-update-notify.timer,
+                     excitel-logs.timer, excitel-logs-boot.timer]
+
+            - name: After-boot notice enabled (runs at the next boot, not now)
+              ansible.builtin.systemd:
+                name: excitel-after-reboot.service
+                enabled: true
+
+
+            # ---------------- 10. does a change need a reboot? ----------------
+            - name: Is zram active now?
+              ansible.builtin.shell: swapon --noheadings --show=NAME | grep -q '^/dev/zram' && echo yes || echo no
+              register: r_zram_active
+              changed_when: false
+              check_mode: false
+
+            - name: Collect reboot reasons
+              ansible.builtin.set_fact:
+                reboot_reasons: >-
+                  {{ (['zram size/settings changed'] if r_zram_cfg.changed else [])
+                   + (['zram not active yet'] if r_zram_active.stdout == 'no' else [])
+                   + (['zram-only swap newly set up'] if (r_speedtune.changed or r_zramonly_script.changed or r_zramonly_unit.changed) else [])
+                   + (['desktop animations changed (need a new login)'] if (r_effects.changed | default(false) or r_schema.changed | default(false)) else [])
+                   + (['Netflix/DRM fix for noexec /home (needs a new login)'] if (r_widevine_units.changed and r_noexec.stdout == 'yes') else [])
+                   + (['new group membership netdev/dialout/wireshark (needs a new login)'] if r_groups.changed | default(false) else []) }}
+
+        - name: Undo the fixes (mode=revert)
+          when: mode == 'revert'
+          block:
+            - name: Is there a backup on this laptop?
+              ansible.builtin.stat:
+                path: /var/lib/browser-slowness-playbook/backup.done
+              register: r_has_backup
+
+            - name: Nothing to undo (already reverted, or never applied)
+              when: not r_has_backup.stat.exists
+              block:
+                - name: Note it in the laptop log
+                  ansible.builtin.shell: cat >> {{ laptop_log }}
+                  changed_when: false
+                  args:
+                    stdin: "===== {{ now(fmt='%Y-%m-%d %H:%M:%S') }} REVERT: nothing to undo on {{ ansible_hostname }} (no backup) =====\n"
+                  check_mode: false
+
+                - name: End here for this laptop
+                  ansible.builtin.meta: end_host
+
+            - name: Is the animations tool there?
+              ansible.builtin.stat:
+                path: /usr/local/sbin/cinnamon-effects-off
+              register: r_effects_tool
+
+            - name: Animations back to each user's own values
+              ansible.builtin.command: /usr/local/sbin/cinnamon-effects-off --restore
+              register: r_effects_restore
+              changed_when: "'RESTORED' in r_effects_restore.stdout"
+              when: r_effects_tool.stat.exists
+
+            - name: Files and services back to the original
+              ansible.builtin.command: /usr/local/sbin/browser-slowness-backup restore
+              register: r_restore
+              changed_when: true
+
+            - name: Remove the backup tool
+              ansible.builtin.file:
+                path: /usr/local/sbin/browser-slowness-backup
+                state: absent
+
+            - name: Revert log text and restart
+              ansible.builtin.set_fact:
+                reboot_reasons: ['revert: zram, swap and memory settings return to the original at the restart']
+                run_log: |
+                  ===== {{ now(fmt='%Y-%m-%d %H:%M:%S') }} browser-slowness playbook (v5) REVERT on {{ ansible_hostname }} =====
+                  Run by: {{ lookup('env', 'USER') or lookup('env', 'LOGNAME') or '?' }}{{ '   (DRY RUN - nothing changed)' if ansible_check_mode else '' }}
+                  Animations: {{ (r_effects_restore.stdout_lines | default([]) | join(', ')) or 'nothing to restore' }}
+                  Restore:
+                  {{ r_restore.stdout | default('n/a') | indent(2, true) }}
+
+      rescue:
+        - name: Write the failure to the logs
+          ansible.builtin.set_fact:
+            fail_text: "FAILED at task '{{ ansible_failed_task.name | default('?') }}': {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('unknown error')) }}"
+
+        - name: Failure in the laptop log
+          ansible.builtin.shell: cat >> {{ laptop_log }}
+          changed_when: false
+          args:
+            stdin: "===== {{ now(fmt='%Y-%m-%d %H:%M:%S') }} browser-slowness playbook ===== \n{{ fail_text }}\n"
+          check_mode: false
+
+        - name: Failure in the Ansible machine log
+          ansible.builtin.shell: cat >> "{{ controller_log_dir }}/{{ ansible_hostname }}.log"
+          changed_when: false
+          args:
+            stdin: "===== {{ now(fmt='%Y-%m-%d %H:%M:%S') }} {{ ansible_hostname }} ===== \n{{ fail_text }}\n"
+          delegate_to: localhost
+          become: false
+          check_mode: false
+
+        - name: Stop this laptop
+          ansible.builtin.fail:
+            msg: "{{ fail_text }}"
+
+    # ---------------- 9. log of this run ----------------
+    - name: When did this playbook last restart the laptop?
+      ansible.builtin.stat:
+        path: /var/lib/browser-slowness-reboot.stamp
+      register: r_stamp
+
+    - name: Decide about the restart
+      ansible.builtin.set_fact:
+        reboot_action: >-
+          {{ 'none' if not reboot_reasons
+             else 'disabled' if not (allow_reboot | bool)
+             else 'dryrun' if ansible_check_mode
+             else 'skipped' if (r_stamp.stat.exists and (ansible_date_time.epoch | int - r_stamp.stat.mtime | int) < 86400)
+             else 'scheduled' }}
+
+    - name: Restart line for the log
+      ansible.builtin.set_fact:
+        reboot_line: >-
+          {{ 'not needed' if reboot_action == 'none'
+             else ('NEEDED - ' ~ (reboot_reasons | join('; ')) ~ ' - ' ~
+                   {'disabled': 'allow_reboot=false: please restart later',
+                    'dryrun': 'dry run: no restart',
+                    'skipped': 'SKIPPED: this playbook already restarted the laptop in the last 24 hours - please check zram',
+                    'scheduled': 'restart scheduled in ' ~ reboot_warning_minutes ~ ' minutes (warning shown; cancel: sudo shutdown -c)'}[reboot_action]) }}
+
+    - name: Build the run log
+      when: mode == 'apply'
+      ansible.builtin.set_fact:
+        run_log: |
+          ===== {{ now(fmt='%Y-%m-%d %H:%M:%S') }} browser-slowness playbook (v5) on {{ ansible_hostname }} =====
+          Run by: {{ lookup('env', 'USER') | default('?') }} from {{ lookup('pipe', 'hostname') }}{{ '   (DRY RUN - nothing changed)' if ansible_check_mode else '' }}
+          Before:
+          {{ before.stdout | default('n/a') | indent(2, true) }}
+          Changes (CHANGED = was different and has been set, OK = already correct):
+            earlyoom settings ............ {{ 'CHANGED' if r_earlyoom_cfg.changed else 'OK' }}
+            zram swap ({{ zram_percent }}% of RAM) ...... {{ 'CHANGED' if r_zram_cfg.changed else 'OK' }}
+            packages ..................... {{ 'INSTALLED' if r_packages.changed else 'OK' }}
+            memory settings (sysctl) ..... {{ 'CHANGED' if r_sysctl.changed else 'OK' }}
+            zram-only swap ............... {{ 'CHANGED' if (r_speedtune.changed or r_zramonly_script.changed or r_zramonly_unit.changed) else 'OK' }}
+            Chrome speed policies ........ {{ 'CHANGED' if r_policy.changed else 'OK' }}
+            Cinnamon animations off ...... {{ ('CHANGED ' ~ (r_effects.stdout_lines | default([]) | join(', '))) if r_effects.changed | default(false) else ('OK' if r_cinnamon.stat.exists else 'SKIPPED (no Cinnamon)') }}
+            Netflix/DRM noexec fix ....... {{ ('active (/home is noexec)' if r_noexec.stdout == 'yes' else 'installed, not needed (/home not noexec)') }}{{ ' - hint removed' if r_widevine_now.changed else '' }}
+            Browser monitor + report ..... {{ 'CHANGED' if (r_collect.changed or r_monitor_units.changed) else 'OK' }}
+            VPN plugins .................. {{ 'INSTALLED' if r_vpn_pkgs.changed | default(false) else 'OK' }}
+            VPN/Wi-Fi/RustDesk rights .... {{ 'CHANGED' if r_polkit.changed | default(false) else 'OK' }}
+            Wi-Fi power saving off ....... {{ 'CHANGED' if (r_wifi_ps.changed | default(false) or r_wifi_now.changed | default(false)) else 'OK' }}
+            Wireshark without sudo ....... {{ r_wireshark.stdout | default('n/a') | replace('CHANGED', 'turned on') }}
+            Groups (netdev/dialout/ws) ... {{ ('CHANGED: ' ~ (r_groups.stdout_lines | default([]) | join(', '))) if r_groups.changed | default(false) else 'OK' }}
+            Update pop-ups hidden ........ {{ 'CHANGED' if r_popups.changed | default(false) else 'OK' }}
+            Automatic updates ............ {{ 'CHANGED' if (r_aptcfg.changed | default(false) or r_apt_timers.changed | default(false)) else 'OK' }}
+            Restarts Sun+Thu 07:00 ....... on (check: excitel-maintenance status)
+
+    - name: Run log on the laptop
+      ansible.builtin.shell: cat >> {{ laptop_log }} && chmod 644 {{ laptop_log }}
+      changed_when: false
+      args:
+        stdin: "{{ run_log }}Reboot: {{ reboot_line }}\n"
+      check_mode: false
+
+    - name: Run log on the Ansible machine
+      ansible.builtin.shell: cat >> "{{ controller_log_dir }}/{{ ansible_hostname }}.log"
+      changed_when: false
+      args:
+        stdin: "{{ run_log }}Reboot: {{ reboot_line }}\n"
+      delegate_to: localhost
+      become: false
+      check_mode: false
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg: "{{ run_log.splitlines() + ['Reboot: ' ~ reboot_line] }}"
+
+    # ---------------- 10. restart only when needed ----------------
+    - name: Restart in {{ reboot_warning_minutes }} minutes (only when a change needs it)
+      when: reboot_action == 'scheduled'
+      block:
+        - name: Restart-warning tool
+          ansible.builtin.copy:
+            dest: /usr/local/sbin/restart-warning
+            mode: "0755"
+            content: !unsafe |
+              #!/bin/bash
+              # restart-warning MINUTES : desktop notice + terminal message to everyone logged in
+              M="${1:-5}"
+              MSG="IT maintenance: this laptop will restart in $M minutes to finish a speed fix. Please save your work."
+              cd /
+              for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+                t=$(loginctl show-session "$s" -p Type --value 2>/dev/null)
+                [[ $t == x11 || $t == wayland ]] || continue
+                u=$(loginctl show-session "$s" -p Name --value); uid=$(id -u "$u" 2>/dev/null) || continue
+                runuser -u "$u" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                  notify-send -u critical -i system-reboot "Restart in $M minutes" "$MSG" 2>/dev/null || true
+              done
+              wall "$MSG" 2>/dev/null || true
+              exit 0
+
+        - name: Warn the logged-in user
+          ansible.builtin.command: /usr/local/sbin/restart-warning {{ reboot_warning_minutes }}
+          changed_when: false
+
+        - name: Remember this restart (max one per 24 hours)
+          ansible.builtin.copy:
+            dest: /var/lib/browser-slowness-reboot.stamp
+            mode: "0644"
+            content: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }} {{ reboot_reasons | join('; ') }}\n"
+
+        - name: Schedule the restart (the playbook finishes now; cancel with 'sudo shutdown -c')
+          ansible.builtin.command:
+            argv:
+              - shutdown
+              - -r
+              - "+{{ reboot_warning_minutes }}"
+              - "IT maintenance - restarting to finish a speed fix. Please save your work."
+          changed_when: true
